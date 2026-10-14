@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"mime"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -34,13 +36,17 @@ type DesktopApp struct {
 	roomList         *RoomList
 	chat             *ChatView
 	avatars          *avatarCache
+	mediaImages      *mediaCache
 	selectedRoom     string
 	loadSequence     uint64
 	syncReady        bool
 	themeDark        bool
 	lastAnsweredRoom string
 	quickSwitcher    dialog.Dialog
+	mediaDialog      dialog.Dialog
+	foreground       bool
 	shutdownOnce     sync.Once
+	appFocused       chan struct{}
 }
 
 func (d *DesktopApp) sendMessageWithMentions(roomID, text string, userIDs []string) {
@@ -67,14 +73,34 @@ func NewApp(backend *matrix.Client) *DesktopApp {
 	window := fyneApp.NewWindow("Matrix")
 	ctx, cancel := context.WithCancel(context.Background())
 	desktopApp := &DesktopApp{
-		backend: backend,
-		fyneApp: fyneApp,
-		window:  window,
-		ctx:     ctx,
-		cancel:  cancel,
+		backend:    backend,
+		fyneApp:    fyneApp,
+		window:     window,
+		ctx:        ctx,
+		cancel:     cancel,
+		foreground: true,
+		appFocused: make(chan struct{}, 1),
 	}
 	desktopApp.avatars = newAvatarCache(ctx, backend.DownloadAvatar)
+	desktopApp.mediaImages = newMediaCache(ctx, func(fetchCtx context.Context, key string) ([]byte, error) {
+		mxc, _, ok := strings.Cut(key, "\x00")
+		if !ok {
+			mxc = key
+		}
+		return backend.CachedMediaBytes(fetchCtx, mxc)
+	})
 	desktopApp.applyTheme(fyneApp.Preferences().StringWithFallback("appearance.theme", "System default"))
+	desktopApp.applyCompact(fyneApp.Preferences().Bool("appearance.compact"))
+	if lifecycle, ok := fyneApp.(interface{ Lifecycle() fyne.Lifecycle }); ok {
+		lifecycle.Lifecycle().SetOnEnteredForeground(func() {
+			desktopApp.foreground = true
+			select {
+			case desktopApp.appFocused <- struct{}{}:
+			default:
+			}
+		})
+		lifecycle.Lifecycle().SetOnExitedForeground(func() { desktopApp.foreground = false })
+	}
 	window.Resize(fyne.NewSize(1100, 720))
 	window.SetCloseIntercept(func() {
 		desktopApp.closeWindow()
@@ -177,13 +203,37 @@ func (d *DesktopApp) Run() {
 	if d.backend.IsLoggedIn() {
 		d.showStarting()
 		go func() {
-			err := d.backend.Start(d.ctx)
+			// Retry transient startup failures with backoff; reflect retries in status.
+			var err error
+			for attempt := 1; attempt <= 8; attempt++ {
+				err = d.backend.Start(d.ctx)
+				if err == nil || d.ctx.Err() != nil {
+					break
+				}
+				delay := matrix.LastReconnectDelay(attempt)
+				status := fmt.Sprintf("Connection failed, retrying in %s… (%v)", delay.Round(time.Second), err)
+				fyne.Do(func() {
+					if d.ctx.Err() == nil {
+						d.chatStatus(status)
+					}
+				})
+				timer := time.NewTimer(delay)
+				select {
+				case <-d.ctx.Done():
+					timer.Stop()
+				case <-timer.C:
+				}
+				if d.ctx.Err() != nil {
+					break
+				}
+			}
+			startErr := err
 			fyne.Do(func() {
 				if d.ctx.Err() != nil {
 					return
 				}
-				if err != nil {
-					d.showError(err)
+				if startErr != nil {
+					d.showError(startErr)
 					return
 				}
 				if d.backend.NeedsVerification() {
@@ -199,6 +249,15 @@ func (d *DesktopApp) Run() {
 	d.window.ShowAndRun()
 	d.cancel()
 	d.backend.Close()
+}
+
+// chatStatus reports startup status before the chat view exists.
+func (d *DesktopApp) chatStatus(status string) {
+	if d.chat != nil {
+		d.chat.SetStatus(status)
+		return
+	}
+	d.window.SetTitle("Matrix - " + status)
 }
 
 func (d *DesktopApp) showStarting() {
@@ -220,6 +279,11 @@ func (d *DesktopApp) listenForBackendEvents() {
 		}
 	}
 }
+
+// loginCardWidth is the fixed width of the centered login card. Every row of
+// the form stretches to this width (minus card padding) so all fields, labels,
+// and the button share the same left and right edges.
+const loginCardWidth = float32(560)
 
 func (d *DesktopApp) showLogin() {
 	homeserver := widget.NewEntry()
@@ -285,9 +349,14 @@ func (d *DesktopApp) showLogin() {
 		password,
 	)
 	login.Importance = widget.HighImportance
+	subtitle := widget.NewLabel("Sign in with the account you use in any Matrix client.")
+	subtitle.Wrapping = fyne.TextWrapWord
+	status.Wrapping = fyne.TextWrapWord
+	footer := widget.NewLabel("This app keeps your session and message history on this device so you can pick up where you left off. Protect your device account to keep that data private.")
+	footer.Wrapping = fyne.TextWrapWord
 	panel := widget.NewCard("", "", container.NewVBox(
 		widget.NewLabelWithStyle("Welcome to Matrix", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Sign in with the account you use in any Matrix client."),
+		subtitle,
 		widget.NewSeparator(),
 		homeserverField,
 		usernameField,
@@ -295,10 +364,33 @@ func (d *DesktopApp) showLogin() {
 		login,
 		status,
 		widget.NewSeparator(),
-		widget.NewLabel("This app keeps your session and message history on this device so you can pick up where you left off. Protect your device account to keep that data private."),
+		footer,
 	))
-	card := container.NewGridWrap(fyne.NewSize(560, 620), panel)
-	d.window.SetContent(container.NewCenter(card))
+	// Fixed width keeps every row aligned; height stays natural so long
+	// status or error text is never clipped.
+	d.window.SetContent(container.NewCenter(container.New(&fixedWidthLayout{width: loginCardWidth}, panel)))
+}
+
+// fixedWidthLayout lays out its single object at a fixed width while keeping
+// the object's natural height. Unlike container.NewGridWrap it does not force
+// a fixed height, so wrapped text can grow without being clipped.
+type fixedWidthLayout struct {
+	width float32
+}
+
+func (l *fixedWidthLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.Size{}
+	}
+	return fyne.NewSize(l.width, objects[0].MinSize().Height)
+}
+
+func (l *fixedWidthLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	objects[0].Resize(size)
+	objects[0].Move(fyne.Position{})
 }
 
 func loginField(label, explanation string, input *widget.Entry) fyne.CanvasObject {
@@ -307,7 +399,7 @@ func loginField(label, explanation string, input *widget.Entry) fyne.CanvasObjec
 	return container.NewVBox(
 		widget.NewLabelWithStyle(label, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		explainer,
-		container.NewGridWrap(fyne.NewSize(520, 40), input),
+		input,
 	)
 }
 
@@ -315,6 +407,7 @@ func (d *DesktopApp) showVerification() {
 	recoveryKey := widget.NewPasswordEntry()
 	recoveryKey.SetPlaceHolder("Recovery key or Secure Backup passphrase")
 	status := widget.NewLabel("Verify this device to restore encryption keys and start syncing.")
+	status.Wrapping = fyne.TextWrapWord
 	verify := widget.NewButton("Verify and continue", nil)
 	verify.OnTapped = func() {
 		if recoveryKey.Text == "" {
@@ -347,18 +440,40 @@ func (d *DesktopApp) showVerification() {
 	)))
 }
 
+// showSASVerification is a best-effort SAS entry point. gomuks exposes
+// recovery-key verification through this client; interactive emoji/number SAS
+// against another device is not available in the embedded SDK, so this dialog
+// explains that boundary and routes the user to the supported recovery flow.
+func (d *DesktopApp) showSASVerification() {
+	body := widget.NewLabel("Interactive emoji/number verification against Beeper Mobile/Desktop is not available in the embedded gomuks SDK used by this client. Use \"Enter recovery key…\" with your 48-character Matrix Security Key or Secure Backup passphrase to verify this device and restore encrypted history.")
+	body.Wrapping = fyne.TextWrapWord
+	dialog.ShowCustomConfirm("Session verification", "Enter recovery key", "Close", body, func(recover bool) {
+		if recover {
+			d.showVerification()
+		}
+	}, d.window)
+}
+
 func (d *DesktopApp) showMain() {
 	d.chat = NewChatView(d.sendMessage)
 	d.chat.SetAvatarCache(d.avatars)
+	d.chat.SetMediaCache(d.mediaImages)
 	d.chat.SetSendOnCtrlEnter(d.fyneApp.Preferences().Bool("composer.ctrl_enter"))
 	d.chat.SetShowAvatars(d.fyneApp.Preferences().BoolWithFallback("appearance.show_avatars", true))
+	d.chat.SetBubbleColor(d.fyneApp.Preferences().Color("appearance.bubble_color"))
+	d.chat.SetCompact(d.fyneApp.Preferences().Bool("appearance.compact"))
 	d.chat.Set24HourTime(d.fyneApp.Preferences().Bool("appearance.time_24_hour"))
 	d.chat.SetLoadOlderHandler(d.loadOlderMessages)
 	d.chat.SetRetryHandler(d.retryMessage)
 	d.chat.SetTypingHandler(d.sendTyping)
 	d.chat.SetReplyHandler(d.sendReply, d.chat.selectReply)
 	d.chat.SetReactionHandler(d.reactToMessage)
+	d.chat.SetReactionPickerHandler(d.showReactionPicker)
+	d.chat.SetCopyHandler(d.copyText)
+	d.chat.SetMediaOpenHandler(d.showMediaViewer)
+	d.chat.SetScrollTopHandler(func() { d.loadOlderMessages(d.selectedRoom, d.chat.OlderCursor()) })
 	d.chat.SetEditHandler(d.editMessage)
+	d.chat.SetEditSendHandler(d.sendEditedMessage)
 	d.chat.SetRedactHandler(d.confirmRedact)
 	d.chat.SetSearchHandler(d.searchMessages)
 	d.chat.SetLeaveHandler(d.confirmLeaveRoom)
@@ -416,6 +531,9 @@ func (d *DesktopApp) applyUpdate(update matrix.Update) {
 		if d.fyneApp.Preferences().Bool("room.muted."+notification.RoomID) || notification.RoomID == d.selectedRoom {
 			continue
 		}
+		if d.foreground && d.fyneApp.Preferences().BoolWithFallback("notifications.only_when_unfocused", true) {
+			continue
+		}
 		privacy := d.fyneApp.Preferences().StringWithFallback("notifications.privacy", "Sender and message preview")
 		title := notification.Room
 		if room := d.findRoom(update.Rooms, notification.RoomID); title == "" && room != nil {
@@ -433,6 +551,9 @@ func (d *DesktopApp) applyUpdate(update matrix.Update) {
 			body = "New activity"
 		}
 		d.fyneApp.SendNotification(fyne.NewNotification(title, body))
+		if d.fyneApp.Preferences().Bool("notifications.sound") {
+			d.playNotificationSound()
+		}
 	}
 	if update.Error != "" {
 		d.showError(errors.New(update.Error))
@@ -601,20 +722,108 @@ func (d *DesktopApp) reactToMessage(message matrix.Message, emoji string) {
 	}()
 }
 
-func (d *DesktopApp) editMessage(message matrix.Message) {
-	roomID := d.selectedRoom
-	editor := dialog.NewEntryDialog("Edit message", "Update the message text:", func(text string) {
-		if strings.TrimSpace(text) == "" {
+// showReactionPicker implements the message hover "+" action with common emoji.
+func (d *DesktopApp) showReactionPicker(message matrix.Message) {
+	emojis := []string{"❤️", "👍", "👎", "😂", "😮", "😢", "🎉", "🔥"}
+	buttons := make([]fyne.CanvasObject, 0, len(emojis))
+	var picker dialog.Dialog
+	for _, emoji := range emojis {
+		choice := emoji
+		buttons = append(buttons, widget.NewButton(choice, func() {
+			picker.Hide()
+			d.reactToMessage(message, choice)
+		}))
+	}
+	picker = dialog.NewCustom("React", "Cancel", container.NewGridWithColumns(4, buttons...), d.window)
+	picker.Resize(fyne.NewSize(320, 200))
+	picker.Show()
+}
+
+// copyText copies composer/code text to the clipboard.
+func (d *DesktopApp) copyText(text string) {
+	if text == "" {
+		return
+	}
+	d.window.Clipboard().SetContent(text)
+}
+
+// playNotificationSound is a best-effort audible cue (terminal bell) honoring the toggle.
+func (d *DesktopApp) playNotificationSound() {
+	fmt.Fprint(os.Stderr, "\a")
+}
+
+// showMediaViewer opens the clickable lightbox with save/copy actions.
+func (d *DesktopApp) showMediaViewer(message matrix.Message) {
+	if message.MediaURI == "" {
+		return
+	}
+	if strings.HasPrefix(message.MediaMIME, "audio/") || strings.HasPrefix(message.MediaMIME, "video/") {
+		d.downloadMedia(message)
+		return
+	}
+	if d.mediaDialog != nil {
+		d.mediaDialog.Hide()
+	}
+	status := widget.NewLabel("Loading media…")
+	content := container.NewVBox(status)
+	viewer := dialog.NewCustom("Media", "Close", content, d.window)
+	viewer.Resize(fyne.NewSize(720, 560))
+	d.mediaDialog = viewer
+	viewer.Show()
+	key := message.MediaURI + "\x00" + d.selectedRoom
+	d.mediaImages.load(key, func(img image.Image) {
+		if d.ctx.Err() != nil {
 			return
 		}
-		go func() {
-			if err := d.backend.EditMessage(d.ctx, roomID, text, message.ID); err != nil {
-				fyne.Do(func() { d.showError(err) })
-			}
-		}()
-	}, d.window)
-	editor.SetText(message.Body)
-	editor.Show()
+		picture := canvas.NewImageFromImage(img)
+		picture.FillMode = canvas.ImageFillContain
+		picture.SetMinSize(fyne.NewSize(640, 420))
+		data, err := d.backend.CachedMediaBytes(d.ctx, message.MediaURI)
+		actions := container.NewHBox(
+			widget.NewButton("Save to disk", func() {
+				if err == nil {
+					d.showMediaSaveDialog(data, message.MediaMIME)
+				}
+			}),
+			widget.NewButton("Copy (path)", func() {
+				if path, ok := d.backend.CachedMediaPath(message.MediaURI); ok {
+					d.copyText(path)
+				} else if err == nil {
+					d.copyText(message.MediaURI)
+				}
+			}),
+		)
+		content.Objects = []fyne.CanvasObject{picture, actions}
+		content.Refresh()
+	})
+	go func() {
+		if _, err := d.backend.CachedMediaBytes(d.ctx, message.MediaURI); err != nil {
+			fyne.Do(func() {
+				if d.ctx.Err() == nil {
+					status.SetText("Unable to load media: " + err.Error())
+				}
+			})
+		}
+	}()
+}
+
+func (d *DesktopApp) editMessage(message matrix.Message) {
+	d.chat.BeginEdit(message)
+	d.window.Canvas().Focus(d.chat.input.Entry)
+}
+
+func (d *DesktopApp) sendEditedMessage(roomID, text, eventID string) {
+	go func() {
+		if err := d.backend.EditMessage(d.ctx, roomID, text, eventID); err != nil {
+			fyne.Do(func() {
+				if d.ctx.Err() == nil {
+					d.showError(err)
+				}
+			})
+			return
+		}
+		fyne.Do(func() { d.reloadMessages(roomID) })
+	}()
 }
 
 func (d *DesktopApp) confirmRedact(message matrix.Message) {
@@ -676,6 +885,126 @@ func (d *DesktopApp) downloadMedia(message matrix.Message) {
 			d.showMediaSaveDialog(data, message.MediaMIME)
 		})
 	}()
+}
+
+func (d *DesktopApp) exportRoomKeys() {
+	passphrase := widget.NewPasswordEntry()
+	confirmation := widget.NewPasswordEntry()
+	form := dialog.NewForm(
+		"Export encrypted room keys",
+		"Continue",
+		"Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Backup passphrase", passphrase),
+			widget.NewFormItem("Confirm passphrase", confirmation),
+		},
+		func(confirmed bool) {
+			if !confirmed {
+				return
+			}
+			if passphrase.Text == "" || passphrase.Text != confirmation.Text {
+				dialog.ShowError(errors.New("enter and confirm the same non-empty passphrase"), d.window)
+				return
+			}
+			secret := passphrase.Text
+			go func() {
+				data, err := d.backend.ExportRoomKeys(d.ctx, secret)
+				fyne.Do(func() {
+					if d.ctx.Err() != nil {
+						return
+					}
+					if err != nil {
+						d.showError(err)
+						return
+					}
+					save := dialog.NewFileSave(func(writer fyne.URIWriteCloser, saveErr error) {
+						if saveErr != nil {
+							d.showError(saveErr)
+							return
+						}
+						if writer == nil {
+							return
+						}
+						go func() {
+							_, writeErr := writer.Write(data)
+							closeErr := writer.Close()
+							if writeErr == nil {
+								writeErr = closeErr
+							}
+							if writeErr != nil {
+								fyne.Do(func() {
+									if d.ctx.Err() == nil {
+										d.showError(fmt.Errorf("save room key backup: %w", writeErr))
+									}
+								})
+							}
+						}()
+					}, d.window)
+					save.SetFileName("matrix-room-keys.txt")
+					save.Show()
+				})
+			}()
+		},
+		d.window,
+	)
+	form.Show()
+}
+
+func (d *DesktopApp) importRoomKeys() {
+	open := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+		if err != nil {
+			d.showError(err)
+			return
+		}
+		if reader == nil {
+			return
+		}
+		go func() {
+			defer reader.Close()
+			const maxKeyBackupBytes = 100 << 20
+			data, readErr := io.ReadAll(io.LimitReader(reader, maxKeyBackupBytes+1))
+			if readErr == nil && len(data) > maxKeyBackupBytes {
+				readErr = fmt.Errorf("room key backup exceeds %d MiB", maxKeyBackupBytes>>20)
+			}
+			fyne.Do(func() {
+				if d.ctx.Err() != nil {
+					return
+				}
+				if readErr != nil {
+					d.showError(fmt.Errorf("read room key backup: %w", readErr))
+					return
+				}
+				passphrase := widget.NewPasswordEntry()
+				passphrase.SetPlaceHolder("Passphrase used when exporting this backup")
+				dialog.ShowForm("Import encrypted room keys", "Import", "Cancel", []*widget.FormItem{
+					widget.NewFormItem("Backup passphrase", passphrase),
+				}, func(confirmed bool) {
+					if !confirmed {
+						return
+					}
+					if passphrase.Text == "" {
+						dialog.ShowError(errors.New("enter the room key backup passphrase"), d.window)
+						return
+					}
+					secret := passphrase.Text
+					go func() {
+						imported, total, importErr := d.backend.ImportRoomKeys(d.ctx, secret, data)
+						fyne.Do(func() {
+							if d.ctx.Err() != nil {
+								return
+							}
+							if importErr != nil {
+								d.showError(importErr)
+								return
+							}
+							dialog.ShowInformation("Room keys imported", fmt.Sprintf("Imported %d of %d room keys.", imported, total), d.window)
+						})
+					}()
+				}, d.window)
+			})
+		}()
+	}, d.window)
+	open.Show()
 }
 
 func (d *DesktopApp) showMediaSaveDialog(data []byte, mediaMIME string) {
@@ -832,12 +1161,22 @@ func (d *DesktopApp) confirmLeaveRoom(roomID string) {
 }
 
 func (d *DesktopApp) confirmLogout() {
-	dialog.ShowConfirm("Log out of Matrix?", "This terminates the server session and removes this app's local message history and encryption keys from this device.", func(confirm bool) {
+	wipeCache := widget.NewCheck("Also clear cached media files", nil)
+	wipeCache.SetChecked(true)
+	items := container.NewVBox(
+		widget.NewLabel("This terminates the server session and removes this app's local message history and encryption keys from this device."),
+		wipeCache,
+	)
+	dialog.ShowCustomConfirm("Log out of Matrix?", "Log out", "Cancel", items, func(confirm bool) {
 		if !confirm {
 			return
 		}
+		clearMedia := wipeCache.Checked
 		go func() {
 			err := d.backend.Logout(d.ctx)
+			if err == nil && clearMedia {
+				err = d.backend.ClearMediaCache()
+			}
 			fyne.Do(func() {
 				if err != nil {
 					dialog.ShowError(err, d.window)
@@ -902,7 +1241,46 @@ func (d *DesktopApp) installShortcuts() {
 			d.chat.submit()
 		}
 	})
-	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyE}, func(fyne.Shortcut) {
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyComma, Modifier: fyne.KeyModifierShortcutDefault}, func(fyne.Shortcut) {
+		d.showSettings()
+	})
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyUp, Modifier: fyne.KeyModifierAlt}, func(fyne.Shortcut) {
+		d.cycleRoom(-1)
+	})
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyDown, Modifier: fyne.KeyModifierAlt}, func(fyne.Shortcut) {
+		d.cycleRoom(1)
+	})
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(fyne.Shortcut) {
+		if d.quickSwitcher != nil {
+			d.quickSwitcher.Hide()
+			d.quickSwitcher = nil
+		} else if d.mediaDialog != nil {
+			d.mediaDialog.Hide()
+			d.mediaDialog = nil
+		} else if d.chat != nil && d.chat.editTarget != nil {
+			d.chat.cancelEdit()
+		} else {
+			canvas.Unfocus()
+		}
+	})
+	d.installAnsweredShortcut(canvas)
+}
+
+// installAnsweredShortcut binds the configurable mark-answered key (default E).
+func (d *DesktopApp) installAnsweredShortcut(canvas fyne.Canvas) {
+	key := strings.ToUpper(strings.TrimSpace(d.fyneApp.Preferences().StringWithFallback("shortcuts.mark_answered", "E")))
+	if key == "" {
+		key = "E"
+	}
+	keyName := fyne.KeyName([]rune(key)[0])
+	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: keyName}, func(fyne.Shortcut) {
+		configured := strings.ToUpper(strings.TrimSpace(d.fyneApp.Preferences().StringWithFallback("shortcuts.mark_answered", "E")))
+		if configured == "" {
+			configured = "E"
+		}
+		if string(keyName) != configured && keyName != fyne.KeyName([]rune(configured)[0]) {
+			return
+		}
 		if d.selectedRoom != "" && canvas.Focused() != d.chat.input.Entry {
 			d.markAnswered(d.selectedRoom)
 		}
@@ -926,23 +1304,6 @@ func (d *DesktopApp) installShortcuts() {
 	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierControl}, func(fyne.Shortcut) {
 		if d.selectedRoom != "" {
 			d.searchMessages(d.selectedRoom)
-		}
-	})
-	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyComma, Modifier: fyne.KeyModifierShortcutDefault}, func(fyne.Shortcut) {
-		d.showSettings()
-	})
-	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyUp, Modifier: fyne.KeyModifierAlt}, func(fyne.Shortcut) {
-		d.cycleRoom(-1)
-	})
-	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyDown, Modifier: fyne.KeyModifierAlt}, func(fyne.Shortcut) {
-		d.cycleRoom(1)
-	})
-	canvas.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(fyne.Shortcut) {
-		if d.quickSwitcher != nil {
-			d.quickSwitcher.Hide()
-			d.quickSwitcher = nil
-		} else {
-			canvas.Unfocus()
 		}
 	})
 }

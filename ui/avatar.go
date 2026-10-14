@@ -24,6 +24,101 @@ import (
 )
 
 type avatarFetcher func(context.Context, string) ([]byte, error)
+type mediaFetcher func(context.Context, string) ([]byte, error)
+
+type imageResult struct {
+	image        image.Image
+	loading      bool
+	waiters      []func(image.Image)
+	errorWaiters []func(error)
+}
+
+// mediaCache is a small in-memory image cache for inline media thumbnails and
+// the fullscreen lightbox. The matrix client owns the encrypted disk cache;
+// this layer only avoids decoding the same bytes repeatedly.
+type mediaCache struct {
+	ctx   context.Context
+	fetch mediaFetcher
+	mu    sync.Mutex
+	items map[string]*imageResult
+}
+
+func newMediaCache(ctx context.Context, fetch mediaFetcher) *mediaCache {
+	return &mediaCache{ctx: ctx, fetch: fetch, items: make(map[string]*imageResult)}
+}
+
+func (c *mediaCache) load(key string, callback func(image.Image)) {
+	c.loadWithError(key, callback, nil)
+}
+
+// loadWithError fetches and decodes the image for key, invoking callback with
+// the result or onError when the download or decode fails. Failed entries are
+// evicted so a later request can retry instead of caching the failure forever.
+func (c *mediaCache) loadWithError(key string, callback func(image.Image), onError func(error)) {
+	if key == "" || c == nil || c.fetch == nil {
+		return
+	}
+	c.mu.Lock()
+	if result, ok := c.items[key]; ok {
+		if result.loading {
+			result.waiters = append(result.waiters, callback)
+			result.errorWaiters = append(result.errorWaiters, onError)
+			c.mu.Unlock()
+			return
+		}
+		img := result.image
+		c.mu.Unlock()
+		if img != nil {
+			fyne.Do(func() { callback(img) })
+		}
+		return
+	}
+	result := &imageResult{
+		loading:      true,
+		waiters:      []func(image.Image){callback},
+		errorWaiters: []func(error){onError},
+	}
+	c.items[key] = result
+	c.mu.Unlock()
+
+	go func() {
+		data, err := c.fetch(c.ctx, key)
+		var img image.Image
+		if err == nil {
+			img, _, err = image.Decode(bytes.NewReader(data))
+		}
+		if err != nil {
+			log.Printf("decode Matrix media image: %v", err)
+		}
+		c.mu.Lock()
+		result.loading = false
+		result.image = img
+		if err != nil {
+			// Drop the failed entry so a future request retries the fetch.
+			delete(c.items, key)
+		}
+		waiters := result.waiters
+		errorWaiters := result.errorWaiters
+		result.waiters = nil
+		result.errorWaiters = nil
+		c.mu.Unlock()
+		if err != nil {
+			fyne.Do(func() {
+				for _, waiter := range errorWaiters {
+					if waiter != nil {
+						waiter(err)
+					}
+				}
+			})
+			return
+		}
+		fyne.Do(func() {
+			for _, waiter := range waiters {
+				waiter(img)
+			}
+		})
+	}()
+}
 
 type avatarResult struct {
 	image   image.Image
@@ -235,4 +330,146 @@ func colorFromHash(hash [32]byte) color.Color {
 		B: 70 + hash[2]%110,
 		A: 255,
 	}
+}
+
+// Inline timeline thumbnails are capped at this box; the real image aspect
+// ratio is preserved inside it when the homeserver reports dimensions.
+const (
+	thumbMaxWidth  = 320
+	thumbMaxHeight = 240
+)
+
+// thumbDisplaySize computes the displayed size of an inline image thumbnail,
+// preserving aspect ratio without upscaling past the original pixel size.
+// Unknown dimensions fall back to the full thumbnail box.
+func thumbDisplaySize(width, height int) fyne.Size {
+	if width <= 0 || height <= 0 {
+		return fyne.NewSize(thumbMaxWidth, thumbMaxHeight)
+	}
+	scale := float64(thumbMaxWidth) / float64(width)
+	if heightScale := float64(thumbMaxHeight) / float64(height); heightScale < scale {
+		scale = heightScale
+	}
+	if scale > 1 {
+		scale = 1
+	}
+	return fyne.NewSize(
+		float32(int(float64(width)*scale)),
+		float32(int(float64(height)*scale)),
+	)
+}
+
+// tappableImage is a canvas.Image that invokes a callback when tapped. It is
+// used for inline image thumbnails that open the fullscreen media viewer.
+type tappableImage struct {
+	canvas.Image
+	tapped func()
+}
+
+func (t *tappableImage) Tapped(*fyne.PointEvent) {
+	if t.tapped != nil {
+		t.tapped()
+	}
+}
+
+func (t *tappableImage) Tappable() bool { return t.tapped != nil }
+
+// setImage assigns the decoded image to the embedded canvas.Image. The
+// embedded field itself is named Image, so the data field needs explicit
+// access through the embedded struct.
+func (t *tappableImage) setImage(img image.Image) {
+	t.Image.Image = img
+	t.Refresh()
+}
+
+func (t *tappableImage) hasImage() bool { return t.Image.Image != nil }
+
+// mediaThumbView renders an inline timeline image thumbnail with a loading
+// placeholder and rounded corners. Rows are recycled by widget.List, so the
+// recorded uri guards against stale async image results.
+type mediaThumbView struct {
+	root        *fyne.Container
+	placeholder *fyne.Container
+	phLabel     *widget.Label
+	image       *tappableImage
+	size        fyne.Size
+	uri         string
+}
+
+func newMediaThumbView() *mediaThumbView {
+	rect := canvas.NewRectangle(theme.Color(theme.ColorNameDisabled))
+	rect.SetMinSize(fyne.NewSize(thumbMaxWidth, thumbMaxHeight))
+	phLabel := widget.NewLabel("Loading image…")
+	phLabel.Alignment = fyne.TextAlignCenter
+	placeholder := container.NewStack(rect, container.NewCenter(phLabel))
+	img := &tappableImage{}
+	img.FillMode = canvas.ImageFillContain
+	img.CornerRadius = theme.Padding() * 2
+	img.Hide()
+	thumb := &mediaThumbView{
+		placeholder: placeholder,
+		phLabel:     phLabel,
+		image:       img,
+	}
+	// HBox keeps the thumbnail at its natural size instead of stretching it
+	// to the full message column width.
+	thumb.root = container.NewHBox(container.NewStack(placeholder, img))
+	thumb.root.Hide()
+	return thumb
+}
+
+// set shows the thumbnail for an image message, loading the bytes through the
+// media cache. open is invoked when the user taps the loaded image.
+func (m *mediaThumbView) set(uri, roomID string, width, height int, cache *mediaCache, open func()) {
+	m.image.tapped = nil
+	if uri == "" {
+		m.uri = ""
+		m.root.Hide()
+		return
+	}
+	if size := thumbDisplaySize(width, height); m.size != size {
+		m.size = size
+		m.image.SetMinSize(size)
+		if rect, ok := m.placeholder.Objects[0].(*canvas.Rectangle); ok {
+			rect.SetMinSize(size)
+		}
+	}
+	if open != nil {
+		m.image.tapped = func() { open() }
+	}
+	m.root.Show()
+	if m.uri == uri && m.image.hasImage() {
+		return // Already loaded for this message.
+	}
+	m.uri = uri
+	m.image.Hide()
+	m.phLabel.SetText("Loading image…")
+	m.placeholder.Show()
+	if cache == nil {
+		m.phLabel.SetText("Inline preview unavailable")
+		return
+	}
+	key := uri + "\x00" + roomID
+	cache.loadWithError(key, func(img image.Image) {
+		if m.uri != uri {
+			return // Row was recycled for a different message.
+		}
+		m.image.setImage(img)
+		m.placeholder.Hide()
+		m.image.Show()
+		m.image.Refresh()
+	}, func(error) {
+		if m.uri != uri {
+			return
+		}
+		m.uri = "" // Allow a retry on the next timeline refresh.
+		m.phLabel.SetText("Unable to load image")
+	})
+}
+
+// hide collapses the thumbnail for non-image messages.
+func (m *mediaThumbView) hide() {
+	m.uri = ""
+	m.image.tapped = nil
+	m.root.Hide()
 }

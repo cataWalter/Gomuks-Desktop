@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"sort"
 	"strings"
 	"time"
@@ -16,29 +17,37 @@ import (
 )
 
 type ChatView struct {
-	title      *widget.Label
-	topic      *widget.Label
-	status     *widget.Label
-	typing     *widget.Label
-	empty      *widget.Label
-	roomAvatar *avatarView
-	loadOlder  *widget.Button
-	replyLabel *widget.Label
-	attach     *widget.Button
-	emoji      *widget.Button
-	completion *widget.Select
-	favorite   *widget.Button
-	mute       *widget.Button
-	messages   *widget.List
-	input      *composerEntry
-	send       *widget.Button
+	title       *widget.Label
+	topic       *widget.Label
+	status      *widget.Label
+	typing      *widget.Label
+	empty       *widget.Label
+	roomAvatar  *avatarView
+	loadOlder   *widget.Button
+	replyLabel  *widget.Label
+	replyCancel *widget.Button
+	replyCard   *widget.Button
+	editLabel   *widget.Label
+	editCancel  *widget.Button
+	attach      *widget.Button
+	emoji       *widget.Button
+	completion  *widget.Select
+	favorite    *widget.Button
+	mute        *widget.Button
+	messages    *widget.List
+	input       *composerEntry
+	send        *widget.Button
 
 	room            matrix.Room
 	history         []matrix.Message
+	historyByID     map[string]int
 	avatars         *avatarCache
 	messageAvatars  map[*fyne.Container]*avatarView
+	bubbles         map[*fyne.Container]*messageBubble
 	retryButtons    map[*fyne.Container]*widget.Button
 	downloadButtons map[*fyne.Container]*widget.Button
+	media           *mediaCache
+	mediaThumbs     map[*fyne.Container]*mediaThumbView
 	onSend          func(roomID, text string)
 	onSendMentions  func(roomID, text string, userIDs []string)
 	onRetry         func(roomID, transactionID string)
@@ -46,7 +55,9 @@ type ChatView struct {
 	onSendReply     func(roomID, text, replyTo string)
 	onReply         func(matrix.Message)
 	onReact         func(matrix.Message, string)
+	onReactionPick  func(matrix.Message)
 	onEdit          func(matrix.Message)
+	onEditSend      func(roomID, text, editID string)
 	onRedact        func(matrix.Message)
 	onLoadOlder     func(roomID string, before int64)
 	onSearch        func(roomID string)
@@ -56,8 +67,12 @@ type ChatView struct {
 	onDownload      func(matrix.Message)
 	onFavorite      func(roomID string)
 	onMute          func(roomID string)
+	onCopy          func(text string)
+	onOpenMedia     func(matrix.Message)
+	onScrollTop     func()
 	typingTimer     *time.Timer
 	before          int64
+	lastTopLoad     time.Time
 	hasOlder        bool
 	loadingOlder    bool
 	loadedOlder     bool
@@ -67,20 +82,43 @@ type ChatView struct {
 	statusText      string
 	typingText      string
 	replyTarget     *matrix.Message
+	editTarget      *matrix.Message
 	members         []matrix.Member
 	completions     []completionOption
 	mentionNames    map[string]string
 	showAvatars     bool
+	compact         bool
 	time24Hour      bool
+	relativeTime    bool
+	bubbleColor     color.Color
 }
+
+// bubblePadding is the inset applied inside a message bubble so its border and
+// background don't touch the row edges.
+const bubblePadding = 8
+
+// bubbleMaxWidth caps the width of an outgoing (own) message bubble so long
+// messages wrap instead of stretching across the full timeline.
+const bubbleMaxWidth = 360
 
 func (v *ChatView) SetShowAvatars(show bool) {
 	v.showAvatars = show
 	v.messages.Refresh()
 }
 
+// SetBubbleColor sets the fill color used for outgoing (own) message bubbles.
+func (v *ChatView) SetBubbleColor(color color.Color) {
+	v.bubbleColor = color
+	v.messages.Refresh()
+}
+
 func (v *ChatView) Set24HourTime(enabled bool) {
 	v.time24Hour = enabled
+	v.messages.Refresh()
+}
+
+func (v *ChatView) SetRelativeTimestamps(enabled bool) {
+	v.relativeTime = enabled
 	v.messages.Refresh()
 }
 
@@ -104,8 +142,44 @@ func (v *ChatView) SetReactionHandler(handler func(matrix.Message, string)) {
 	v.onReact = handler
 }
 
+// SetReactionPickerHandler opens an emoji picker for a message (hover "+" action).
+func (v *ChatView) SetReactionPickerHandler(handler func(matrix.Message)) {
+	v.onReactionPick = handler
+}
+
+// SetCopyHandler copies text (code blocks) to the clipboard.
+func (v *ChatView) SetCopyHandler(handler func(string)) {
+	v.onCopy = handler
+}
+
+// SetMediaOpenHandler opens the fullscreen media viewer.
+func (v *ChatView) SetMediaOpenHandler(handler func(matrix.Message)) {
+	v.onOpenMedia = handler
+}
+
+// SetScrollTopHandler loads older history when the timeline reaches the top.
+func (v *ChatView) SetScrollTopHandler(handler func()) {
+	v.onScrollTop = handler
+}
+
+// SetCompact toggles compact (IRC-style) vs bubble timeline layout.
+func (v *ChatView) SetCompact(compact bool) {
+	v.compact = compact
+	v.messages.Refresh()
+}
+
+// OlderCursor exposes the pagination cursor for scroll-top auto-load.
+func (v *ChatView) OlderCursor() int64 { return v.before }
+
+// CanLoadOlder reports whether older history can be requested.
+func (v *ChatView) CanLoadOlder() bool { return v.hasOlder && !v.loadingOlder }
+
 func (v *ChatView) SetEditHandler(handler func(matrix.Message)) {
 	v.onEdit = handler
+}
+
+func (v *ChatView) SetEditSendHandler(handler func(roomID, text, editID string)) {
+	v.onEditSend = handler
 }
 
 func (v *ChatView) SetRedactHandler(handler func(matrix.Message)) {
@@ -170,13 +244,17 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 		roomAvatar:      newAvatarView(36),
 		onSend:          onSend,
 		messageAvatars:  make(map[*fyne.Container]*avatarView),
+		bubbles:         make(map[*fyne.Container]*messageBubble),
 		retryButtons:    make(map[*fyne.Container]*widget.Button),
 		downloadButtons: make(map[*fyne.Container]*widget.Button),
+		mediaThumbs:     make(map[*fyne.Container]*mediaThumbView),
+		bubbleColor:     theme.Color(theme.ColorNameSecondary),
 		mentionNames:    make(map[string]string),
 		showAvatars:     true,
 	}
 	view.input = newComposerEntry(view.submit)
 	view.input.SetPlaceHolder("Write a message... (Enter to send, Shift+Enter for a new line)")
+	view.input.SetMinRowsVisible(1)
 	view.empty.Wrapping = fyne.TextWrapWord
 	view.loadOlder = widget.NewButton("Load older", view.requestOlder)
 	view.loadOlder.Disable()
@@ -186,6 +264,8 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 			avatar := newAvatarView(32)
 			view.messageAvatars[avatar.root] = avatar
 			details := widget.NewLabel("")
+			replyCard := widget.NewButton("", nil)
+			replyCard.Hide()
 			body := widget.NewRichText()
 			body.Wrapping = fyne.TextWrapWord
 			reactions := widget.NewLabel("")
@@ -193,18 +273,25 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 			retry.Hide()
 			reply := widget.NewButton("Reply", nil)
 			react := widget.NewButton("👍", nil)
+			reactMore := widget.NewButton("+", nil)
 			edit := widget.NewButton("Edit", nil)
 			redact := widget.NewButton("Delete", nil)
 			download := widget.NewButton("Download", nil)
 			download.Hide()
-			row := container.NewHBox(avatar.root, container.NewVBox(details, body, reactions), retry, reply, react, edit, redact, download)
+			thumb := newMediaThumbView()
+			bubble := newMessageBubble()
+			row := container.NewHBox(avatar.root, bubble.root, container.NewVBox(details, replyCard, body, thumb.root, reactions), retry, reply, react, reactMore, edit, redact, download)
 			view.retryButtons[row] = retry
 			view.downloadButtons[row] = download
+			view.mediaThumbs[row] = thumb
 			return row
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
 			if id < 0 || id >= len(view.history) {
 				return
+			}
+			if id == 0 {
+				view.loadOlderIfAtTop()
 			}
 			message := view.history[id]
 			box := object.(*fyne.Container)
@@ -222,20 +309,78 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 				previous := view.history[id-1]
 				showSender = !shouldGroupMessages(previous, message)
 			}
-			detailsText := message.Timestamp.Local().Format(timeFormat)
+			detailsText := messageTimestamp(message.Timestamp.Local(), timeFormat, view.relativeTime, time.Now())
 			if showSender {
 				detailsText = senderName + " | " + detailsText
+			}
+			if message.Edited {
+				detailsText += " | edited"
+				if len(message.EditHistory) > 0 {
+					detailsText += fmt.Sprintf(" (%d prior)", len(message.EditHistory))
+				}
+			}
+			if message.Sending {
+				detailsText += " | ⏳ pending"
+			}
+			if message.DecryptionError != "" {
+				detailsText += " | 🛡 decryption failed"
+			} else if message.Encrypted {
+				detailsText += " | 🔒 encrypted"
 			}
 			details := detailsText
 			if message.Sending {
 				details += " | Sending..."
 			} else if message.SendError != "" {
-				details += " | Failed to send: " + message.SendError
+				details += " | ⚠ Failed to send: " + message.SendError
 			}
 			content := box.Objects[1].(*fyne.Container)
-			content.Objects[0].(*widget.Label).SetText(details)
-			content.Objects[1].(*widget.RichText).ParseMarkdown(message.Body)
-			content.Objects[2].(*widget.Label).SetText(formatReactions(message.Reactions))
+			detailsLabel := content.Objects[0].(*widget.Label)
+			// Compact (IRC-style) rows drop the meta line on grouped continuation
+			// messages unless it carries status information (edited/pending/failed/encryption).
+			hideMeta := view.compact && !showSender && !message.Edited && !message.Sending &&
+				message.SendError == "" && message.DecryptionError == "" && !message.Encrypted
+			if hideMeta {
+				detailsLabel.Hide()
+			} else {
+				detailsLabel.SetText(details)
+				detailsLabel.Show()
+			}
+			if quote := view.replyQuote(message); quote != "" {
+				replyCard := content.Objects[1].(*widget.Button)
+				replyCard.SetText(quote)
+				replyCard.Show()
+				replyCard.OnTapped = func() { view.scrollToMessage(message.ReplyToEventID) }
+			} else {
+				replyCard := content.Objects[1].(*widget.Button)
+				replyCard.Hide()
+				replyCard.OnTapped = nil
+			}
+			body := message.Body
+			if message.Redacted {
+				body = "This message was deleted"
+			} else if message.DecryptionError != "" {
+				body = "Unable to decrypt this message"
+			} else if code := extractCodeBlock(message.Body); code != "" && view.onCopy != nil {
+				body = message.Body + "\n\n[Copy code available via message menu]"
+			}
+			if len([]rune(body)) > maxMessageBodyLen {
+				body = string([]rune(body)[:maxMessageBodyLen-1]) + "…"
+			}
+			content.Objects[2].(*widget.RichText).ParseMarkdown(body)
+			if thumb, ok := view.mediaThumbs[box]; ok {
+				if message.MediaURI != "" && strings.HasPrefix(message.MediaMIME, "image/") &&
+					!message.Redacted && message.DecryptionError == "" {
+					tapMessage := message
+					thumb.set(message.MediaURI, view.room.ID, message.MediaWidth, message.MediaHeight, view.media, func() {
+						if view.onOpenMedia != nil {
+							view.onOpenMedia(tapMessage)
+						}
+					})
+				} else {
+					thumb.hide()
+				}
+			}
+			content.Objects[4].(*widget.Label).SetText(formatReactions(message.Reactions, message.Reacted))
 			retry := view.retryButtons[box]
 			if message.SendError != "" && message.TransactionID != "" && view.onRetry != nil {
 				retry.Show()
@@ -256,7 +401,15 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 					view.onReact(message, "👍")
 				}
 			}
-			edit := box.Objects[5].(*widget.Button)
+			reactMore := box.Objects[5].(*widget.Button)
+			reactMore.OnTapped = func() {
+				if view.onReactionPick != nil {
+					view.onReactionPick(message)
+				} else if view.onReact != nil {
+					view.onReact(message, "❤️")
+				}
+			}
+			edit := box.Objects[6].(*widget.Button)
 			if message.Own && message.ID != "" && !strings.HasPrefix(message.ID, "~") {
 				edit.Show()
 			} else {
@@ -267,7 +420,7 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 					view.onEdit(message)
 				}
 			}
-			redact := box.Objects[6].(*widget.Button)
+			redact := box.Objects[7].(*widget.Button)
 			if message.Own && message.ID != "" && !strings.HasPrefix(message.ID, "~") {
 				redact.Show()
 			} else {
@@ -280,9 +433,20 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 			}
 			download := view.downloadButtons[box]
 			if message.MediaURI != "" && view.onDownload != nil {
-				if strings.HasPrefix(message.MediaMIME, "image/") {
+				switch {
+				case strings.HasPrefix(message.MediaMIME, "image/"):
 					download.SetText("Preview")
-				} else {
+				case strings.HasPrefix(message.MediaMIME, "audio/") || strings.HasPrefix(message.MediaMIME, "video/"):
+					label := fileKindLabel(message.MediaMIME)
+					if message.MediaDurationMs > 0 {
+						label += " · " + formatDuration(message.MediaDurationMs)
+					} else if message.MediaSize > 0 {
+						label += " · " + humanBytes(int64(message.MediaSize))
+					}
+					download.SetText("Play " + label)
+				case message.MediaSize > 0:
+					download.SetText(fmt.Sprintf("%s · %s", fileKindLabel(message.MediaMIME), humanBytes(int64(message.MediaSize))))
+				default:
 					download.SetText("Download")
 				}
 				download.Show()
@@ -291,14 +455,35 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 				download.Hide()
 				download.OnTapped = nil
 			}
-			if view.showAvatars && showSender {
+			if view.showAvatars && showSender && !view.compact {
 				avatar.Show()
 				view.messageAvatars[avatar].set(message.Avatar, senderName, view.avatars)
 			} else {
 				avatar.Hide()
 			}
+			// Outgoing (own) messages render as a right-aligned colored bubble;
+			// incoming messages leave the bubble transparent so it costs nothing
+			// in recycled rows. The bubble's trailing corner is rounded and it is
+			// capped at bubbleMaxWidth so long text wraps instead of stretching.
+			bubble := view.bubbles[box]
+			if message.Own && !view.compact {
+				bubble.show(view.bubbleColor)
+			} else {
+				bubble.hide()
+			}
+			if box.Size().Width > 0 {
+				bubble.body.Resize(fyne.NewSize(
+					box.Size().Width-bubblePadding*2,
+					box.Size().Height-bubblePadding*2,
+				))
+				bubble.body.Move(fyne.NewPos(bubblePadding, bubblePadding))
+			}
 		},
 	)
+	// Older history is requested from the row-0 update callback (loadOlderIfAtTop),
+	// which fires whenever the first message is visible: on refresh and when the
+	// user scrolls back to the top. widget.List in Fyne v2.8 exposes no public
+	// scroll callback, so row visibility is the reliable signal.
 	view.send = widget.NewButtonWithIcon("", theme.MailSendIcon(), view.submit)
 	view.attach = widget.NewButton("Attach", func() {
 		if view.onAttach != nil && view.room.ID != "" {
@@ -322,6 +507,18 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 	})
 	view.replyLabel = widget.NewLabel("")
 	view.replyLabel.Hide()
+	view.replyCard = widget.NewButton("", func() {
+		if view.replyTarget != nil && view.replyTarget.ID != "" {
+			view.scrollToMessage(view.replyTarget.ID)
+		}
+	})
+	view.replyCard.Hide()
+	view.replyCancel = widget.NewButton("×", view.clearReply)
+	view.replyCancel.Hide()
+	view.editLabel = widget.NewLabel("")
+	view.editLabel.Hide()
+	view.editCancel = widget.NewButton("Cancel edit", view.cancelEdit)
+	view.editCancel.Hide()
 	view.completion = widget.NewSelect(nil, view.applyCompletion)
 	view.completion.Hide()
 	view.input.OnChanged = func(text string) {
@@ -358,7 +555,9 @@ func (v *ChatView) Object() fyne.CanvasObject {
 		v.loadOlder,
 	), v.title)
 	header := container.NewVBox(titleBar, v.topic, v.typing, v.status, widget.NewSeparator())
-	composer := container.NewVBox(v.replyLabel, v.completion, container.NewBorder(nil, nil, container.NewHBox(v.attach, v.emoji), v.send, v.input))
+	replyBanner := container.NewBorder(nil, nil, nil, v.replyCancel, container.NewVBox(v.replyLabel, v.replyCard))
+	editBanner := container.NewBorder(nil, nil, nil, v.editCancel, v.editLabel)
+	composer := container.NewVBox(replyBanner, editBanner, v.completion, container.NewBorder(nil, nil, container.NewHBox(v.attach, v.emoji), v.send, v.input))
 	bottom := composer
 	return container.NewBorder(header, bottom, nil, nil, container.NewStack(v.messages, container.NewCenter(v.empty)))
 }
@@ -368,7 +567,12 @@ func (v *ChatView) SetRoom(room matrix.Room) {
 		v.typingTimer.Stop()
 	}
 	v.replyLabel.Hide()
+	v.replyCancel.Hide()
+	if v.replyCard != nil {
+		v.replyCard.Hide()
+	}
 	v.replyTarget = nil
+	v.clearEdit()
 	clear(v.mentionNames)
 	v.members = nil
 	v.completion.Hide()
@@ -408,6 +612,12 @@ func (v *ChatView) UpdateRoom(room matrix.Room) {
 func (v *ChatView) SetAvatarCache(cache *avatarCache) {
 	v.avatars = cache
 	v.roomAvatar.set(v.room.Avatar, v.room.Name, cache)
+	v.messages.Refresh()
+}
+
+// SetMediaCache enables inline image thumbnails in the timeline.
+func (v *ChatView) SetMediaCache(cache *mediaCache) {
+	v.media = cache
 	v.messages.Refresh()
 }
 
@@ -458,6 +668,8 @@ func (v *ChatView) SetHistoryPage(page matrix.HistoryPage, prepend bool) {
 		v.history = append(v.history[:0], page.Messages...)
 		v.loadedOlder = false
 	}
+	v.reindexHistory()
+	v.resolveReplyPreviews()
 	v.before = page.Before
 	v.hasOlder = page.HasMore
 	v.loadingOlder = false
@@ -508,6 +720,26 @@ func (v *ChatView) requestOlder() {
 	v.loadingOlder = true
 	v.updateOlderButton()
 	v.onLoadOlder(v.room.ID, v.before)
+}
+
+// loadOlderIfAtTop fetches older history when the first timeline row is visible.
+// It is called from the row-0 update callback, i.e. whenever the top of the
+// conversation is on screen, and is throttled to at most one request per second.
+func (v *ChatView) loadOlderIfAtTop() {
+	if !v.CanLoadOlder() || v.before == 0 || v.room.ID == "" {
+		return
+	}
+	if time.Since(v.lastTopLoad) < time.Second {
+		return
+	}
+	v.lastTopLoad = time.Now()
+	if v.onScrollTop != nil {
+		v.loadingOlder = true
+		v.updateOlderButton()
+		v.onScrollTop()
+		return
+	}
+	v.requestOlder()
 }
 
 func (v *ChatView) updateOlderButton() {
@@ -565,9 +797,173 @@ func deduplicateMessages(messages []matrix.Message) []matrix.Message {
 	return result
 }
 
+func (v *ChatView) reindexHistory() {
+	if v.historyByID == nil {
+		v.historyByID = make(map[string]int)
+	} else {
+		clear(v.historyByID)
+	}
+	for i, message := range v.history {
+		if message.ID != "" {
+			v.historyByID[message.ID] = i
+		}
+	}
+}
+
+// resolveReplyPreviews fills reply sender/preview from loaded history.
+func (v *ChatView) resolveReplyPreviews() {
+	if len(v.history) == 0 {
+		return
+	}
+	byID := make(map[string]matrix.Message, len(v.history))
+	for _, message := range v.history {
+		if message.ID != "" {
+			byID[message.ID] = message
+		}
+	}
+	for i, message := range v.history {
+		if message.ReplyToEventID == "" || message.ReplyToPreview != "" {
+			continue
+		}
+		if original, ok := byID[message.ReplyToEventID]; ok {
+			sender := original.SenderName
+			if sender == "" {
+				sender = original.Sender
+			}
+			v.history[i].ReplyToSender = sender
+			v.history[i].ReplyToPreview = truncatePreview(original.Body, 80)
+		}
+	}
+}
+
+func truncatePreview(body string, limit int) string {
+	body = strings.ReplaceAll(strings.TrimSpace(body), "\n", " ")
+	if limit <= 0 {
+		return body
+	}
+	runes := []rune(body)
+	if len(runes) <= limit {
+		return body
+	}
+	if limit <= 1 {
+		return "…"
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+// replyQuote renders the reply card text for a message.
+func (v *ChatView) replyQuote(message matrix.Message) string {
+	if message.ReplyToEventID == "" {
+		return ""
+	}
+	sender := message.ReplyToSender
+	if sender == "" {
+		if index, ok := v.historyByID[message.ReplyToEventID]; ok && index >= 0 && index < len(v.history) {
+			original := v.history[index]
+			sender = original.SenderName
+			if sender == "" {
+				sender = original.Sender
+			}
+			preview := truncatePreview(original.Body, 80)
+			if preview == "" {
+				return "↩ Reply"
+			}
+			return "↩ " + sender + ": " + preview
+		}
+		return "↩ Reply to " + message.ReplyToEventID
+	}
+	preview := message.ReplyToPreview
+	if preview == "" {
+		return "↩ " + sender
+	}
+	return "↩ " + sender + ": " + preview
+}
+
+// scrollToMessage jumps the timeline to the replied-to event.
+func (v *ChatView) scrollToMessage(eventID string) {
+	if eventID == "" {
+		return
+	}
+	index, ok := v.historyByID[eventID]
+	if !ok {
+		// Best effort: request older history which may contain the target.
+		v.requestOlder()
+		return
+	}
+	v.messages.ScrollTo(widget.ListItemID(index))
+}
+
+// ScrollToMessage exposes reply navigation for tests and the app layer.
+func (v *ChatView) ScrollToMessage(eventID string) { v.scrollToMessage(eventID) }
+
+// ReplyPreviewFor exposes the reply card text for tests.
+func (v *ChatView) ReplyPreviewFor(message matrix.Message) string { return v.replyQuote(message) }
+
+// extractCodeBlock returns the first fenced code block body, if any.
+func extractCodeBlock(body string) string {
+	start := strings.Index(body, "```")
+	if start < 0 {
+		return ""
+	}
+	rest := body[start+3:]
+	// Skip optional language tag on the opening fence line.
+	if newline := strings.Index(rest, "\n"); newline >= 0 {
+		rest = rest[newline+1:]
+	} else {
+		return ""
+	}
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+// formatReactions renders pills and marks own reactions with ●.
+func formatReactions(counts map[string]int, reacted map[string]bool) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	emojis := make([]string, 0, len(counts))
+	for emoji := range counts {
+		emojis = append(emojis, emoji)
+	}
+	sort.Strings(emojis)
+	parts := make([]string, 0, len(emojis))
+	for _, emoji := range emojis {
+		part := fmt.Sprintf("%s %d", emoji, counts[emoji])
+		if reacted[emoji] {
+			part = "● " + part
+		}
+		parts = append(parts, "["+part+"]")
+	}
+	return strings.Join(parts, " ")
+}
+
 func shouldGroupMessages(previous, current matrix.Message) bool {
 	delta := current.Timestamp.Sub(previous.Timestamp)
 	return previous.Sender == current.Sender && delta >= 0 && delta <= 5*time.Minute
+}
+
+func messageTimestamp(timestamp time.Time, clockFormat string, relative bool, now time.Time) string {
+	if !relative {
+		return timestamp.Format(clockFormat)
+	}
+	delta := now.Sub(timestamp)
+	switch {
+	case delta < 0:
+		return timestamp.Format(clockFormat)
+	case delta < time.Minute:
+		return "now"
+	case delta < time.Hour:
+		return fmt.Sprintf("%dm ago", int(delta.Minutes()))
+	case delta < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(delta.Hours()))
+	case delta < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(delta.Hours()/24))
+	default:
+		return timestamp.Format("Jan 2")
+	}
 }
 
 func sortMessages(messages []matrix.Message) {
@@ -608,7 +1004,21 @@ func (v *ChatView) SetTypingStatus(users []string) {
 
 func (v *ChatView) submit() {
 	text := strings.TrimSpace(v.input.Text)
-	if v.room.ID == "" || text == "" || (v.onSend == nil && v.onSendMentions == nil && v.onSendReply == nil) {
+	if v.room.ID == "" || text == "" {
+		return
+	}
+	if v.editTarget != nil {
+		if v.onEditSend == nil {
+			return
+		}
+		editID := v.editTarget.ID
+		roomID := v.room.ID
+		v.clearEdit()
+		v.input.SetText("")
+		v.onEditSend(roomID, text, editID)
+		return
+	}
+	if v.onSend == nil && v.onSendMentions == nil && v.onSendReply == nil {
 		return
 	}
 	mentionIDs := make([]string, 0, len(v.mentionNames))
@@ -636,24 +1046,85 @@ func (v *ChatView) selectReply(message matrix.Message) {
 		return
 	}
 	v.replyTarget = &message
-	v.replyLabel.SetText("Replying to " + message.SenderName + ": " + message.Body)
+	sender := message.SenderName
+	if sender == "" {
+		sender = message.Sender
+	}
+	preview := truncatePreview(message.Body, 100)
+	v.replyLabel.SetText("Replying to " + sender)
 	v.replyLabel.Show()
+	v.replyCard.SetText("↩ " + preview)
+	v.replyCard.Show()
+	v.replyCancel.Show()
+	v.editTarget = nil
+	v.editLabel.Hide()
+	v.editCancel.Hide()
 }
 
-func formatReactions(reactions map[string]int) string {
-	if len(reactions) == 0 {
-		return ""
+func (v *ChatView) clearReply() {
+	v.replyTarget = nil
+	v.replyLabel.Hide()
+	if v.replyCard != nil {
+		v.replyCard.Hide()
 	}
-	keys := make([]string, 0, len(reactions))
-	for key := range reactions {
-		keys = append(keys, key)
+	v.replyCancel.Hide()
+}
+
+func (v *ChatView) BeginEdit(message matrix.Message) {
+	if message.ID == "" || strings.HasPrefix(message.ID, "~") {
+		return
 	}
-	sort.Strings(keys)
-	values := make([]string, 0, len(keys))
-	for _, key := range keys {
-		values = append(values, fmt.Sprintf("%s %d", key, reactions[key]))
+	v.clearReply()
+	v.editTarget = &message
+	v.editLabel.SetText("Editing message")
+	v.editLabel.Show()
+	v.editCancel.Show()
+	v.input.SetText(message.Body)
+	v.updateComposerState()
+}
+
+func (v *ChatView) clearEdit() {
+	v.editTarget = nil
+	if v.editLabel != nil {
+		v.editLabel.Hide()
 	}
-	return strings.Join(values, "  ")
+	if v.editCancel != nil {
+		v.editCancel.Hide()
+	}
+}
+
+func (v *ChatView) cancelEdit() {
+	v.clearEdit()
+	v.input.SetText("")
+	v.updateComposerState()
+}
+
+func fileKindLabel(mimeType string) string {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	switch {
+	case mimeType == "":
+		return "File"
+	case strings.HasPrefix(mimeType, "image/"):
+		return "Image"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "Audio"
+	case strings.HasPrefix(mimeType, "video/"):
+		return "Video"
+	case strings.Contains(mimeType, "pdf"):
+		return "PDF"
+	case strings.Contains(mimeType, "zip") || strings.Contains(mimeType, "archive"):
+		return "Archive"
+	default:
+		return "File"
+	}
+}
+
+func formatDuration(durationMs int) string {
+	if durationMs <= 0 {
+		return "0:00"
+	}
+	seconds := durationMs / 1000
+	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
 }
 
 func (v *ChatView) updateCompletions(text string) {
@@ -803,4 +1274,36 @@ func (e *composerEntry) TypedKey(key *fyne.KeyEvent) {
 		return
 	}
 	e.Entry.TypedKey(key)
+}
+
+const maxMessageBodyLen = 2000
+
+// messageBubble renders the colored speech-bubble background for a timeline
+// row. It sits between the sender avatar and the metadata/body column so that
+// outgoing (own) messages visually shift right while incoming messages keep
+// their metadata on the left. The bubble is transparent when empty to avoid
+// wasting space in recycled list rows.
+type messageBubble struct {
+	root *fyne.Container
+	body *canvas.Rectangle
+}
+
+func newMessageBubble() *messageBubble {
+	body := canvas.NewRectangle(nil)
+	bubble := &messageBubble{root: container.NewStack(body), body: body}
+	bubble.root.Hide()
+	return bubble
+}
+
+// show renders the bubble for an outgoing (own) message with a tinted fill and
+// a rounded trailing corner. hide clears it so recycled rows stay lightweight.
+func (b *messageBubble) show(color color.Color) {
+	b.body.FillColor = color
+	b.body.Show()
+	b.root.Show()
+}
+
+func (b *messageBubble) hide() {
+	b.body.Hide()
+	b.root.Hide()
 }

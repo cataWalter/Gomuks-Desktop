@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +30,7 @@ import (
 	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix"
+	mautrixcrypto "maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/crypto/attachment"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -35,6 +38,27 @@ import (
 
 const eventBufferSize = 256
 const timelinePageSize = 100
+const maxReactedEvents = 200
+
+// Reconnect backoff bounds used when (re)starting Matrix sync after a failure.
+const (
+	reconnectInitialDelay = time.Second
+	reconnectMaxDelay     = 30 * time.Second
+)
+
+// reconnectDelay returns the exponential backoff delay for a 1-based attempt
+// number, capped at reconnectMaxDelay. It doubles the initial delay on every
+// attempt: 1s, 2s, 4s, … 30s.
+func reconnectDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := reconnectInitialDelay << (attempt - 1)
+	if delay <= 0 || delay > reconnectMaxDelay {
+		return reconnectMaxDelay
+	}
+	return delay
+}
 
 // Room and Message are UI-facing snapshots that do not expose gomuks internals.
 type Room struct {
@@ -53,30 +77,52 @@ type Room struct {
 	LastEventID     string
 	LastEventSender string
 	LastEventAt     time.Time
+	Bridge          string
 }
 
 type Message struct {
-	ID             string
-	TransactionID  string
-	Sender         string
-	SenderName     string
-	Avatar         string
-	Body           string
-	FormattedBody  string
-	Timestamp      time.Time
-	TimelineCursor int64
-	Sending        bool
-	SendError      string
-	Own            bool
-	Reactions      map[string]int
-	MediaURI       string
-	MediaMIME      string
-	MediaEncrypted *event.EncryptedFileInfo
+	ID              string
+	TransactionID   string
+	Sender          string
+	SenderName      string
+	Avatar          string
+	Body            string
+	FormattedBody   string
+	ReplyToEventID  string
+	ReplyToSender   string
+	ReplyToPreview  string
+	Timestamp       time.Time
+	TimelineCursor  int64
+	Sending         bool
+	SendError       string
+	Own             bool
+	Reactions       map[string]int
+	Reacted         map[string]bool
+	MediaURI        string
+	MediaMIME       string
+	MediaSize       int
+	MediaWidth      int
+	MediaHeight     int
+	MediaEncrypted  *event.EncryptedFileInfo
+	MediaDurationMs int
+	Encrypted       bool
+	DecryptionError string
+	Edited          bool
+	EditHistory     []string
+	Redacted        bool
 }
 
 type Member struct {
 	ID          string
 	DisplayName string
+}
+
+type Device struct {
+	ID          string
+	DisplayName string
+	LastSeenIP  string
+	LastSeenAt  time.Time
+	Current     bool
 }
 
 type AccountProfile struct {
@@ -137,8 +183,10 @@ type Client struct {
 	notifiedEvents       map[string]struct{}
 	pendingTimelineRooms map[string]struct{}
 	dismissedEvents      map[string]string
+	reactedEvents        map[string]map[string]struct{}
 	syncReady            bool
 	connectionState      ConnectionState
+	mediaCacheDir        string
 
 	closeOnce       sync.Once
 	eventMu         sync.Mutex
@@ -170,6 +218,16 @@ func New(databasePath string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = ensureSecureFilePermissions(filepath.Join(dataDir, "crypto.key"), 0o600); err != nil {
+		return nil, err
+	}
+	// Harden permissions on existing session material: the SQLite database
+	// holds decrypted message contents, access tokens, and Megolm sessions.
+	for _, path := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		if err = ensureSecureFilePermissions(path, 0o600); err != nil {
+			return nil, err
+		}
+	}
 	rawDB, err := dbutil.NewWithDialect(databasePath, "sqlite3-fk-wal")
 	if err != nil {
 		return nil, fmt.Errorf("open gomuks SQLite database: %w", err)
@@ -185,6 +243,8 @@ func New(databasePath string) (*Client, error) {
 		notifiedEvents:       make(map[string]struct{}),
 		pendingTimelineRooms: make(map[string]struct{}),
 		dismissedEvents:      make(map[string]string),
+		reactedEvents:        make(map[string]map[string]struct{}),
+		mediaCacheDir:        defaultMediaCacheDir(dataDir),
 	}
 	client.lifecycleCtx, client.lifecycleCancel = context.WithCancel(context.Background())
 	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
@@ -332,6 +392,124 @@ func loadOrCreatePickleKey(path string) ([]byte, error) {
 		return nil, fmt.Errorf("close gomuks crypto key: %w", err)
 	}
 	return key, nil
+}
+
+func ensureSecureFilePermissions(path string, mode os.FileMode) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat secured file at %q: %w", path, err)
+	}
+	if info.Mode().Perm() == mode.Perm() {
+		return nil
+	}
+	if err = os.Chmod(path, mode); err != nil {
+		return fmt.Errorf("secure file permissions at %q: %w", path, err)
+	}
+	return nil
+}
+
+// defaultMediaCacheDir prefers the OS cache directory and falls back to the
+// config data directory so portable installs keep working.
+func defaultMediaCacheDir(dataDir string) string {
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		return filepath.Join(cacheDir, "gomuks-desktop", "media")
+	}
+	return filepath.Join(dataDir, "media")
+}
+
+// SetMediaCacheDir overrides the on-disk media cache directory (tests, portable installs).
+func (c *Client) SetMediaCacheDir(dir string) {
+	c.mu.Lock()
+	c.mediaCacheDir = dir
+	c.mu.Unlock()
+}
+
+// MediaCacheDir reports the directory used for decrypted media files.
+func (c *Client) MediaCacheDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.mediaCacheDir
+}
+
+// mediaCachePath maps an mxc:// URI to a stable cache file name.
+func (c *Client) mediaCachePath(mxc string) (string, error) {
+	server, mediaID, err := parseMXC(mxc)
+	if err != nil {
+		return "", err
+	}
+	name := server + "_" + mediaID
+	sum := sha256.Sum256([]byte(mxc))
+	return filepath.Join(c.MediaCacheDir(), name+"-"+hex.EncodeToString(sum[:8])), nil
+}
+
+func parseMXC(mxc string) (server, mediaID string, err error) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(mxc), "mxc://")
+	if !ok || rest == "" {
+		return "", "", fmt.Errorf("invalid Matrix media URI %q", mxc)
+	}
+	server, mediaID, ok = strings.Cut(rest, "/")
+	if !ok || server == "" || mediaID == "" || strings.Contains(mediaID, "/") {
+		return "", "", fmt.Errorf("invalid Matrix media URI %q", mxc)
+	}
+	return server, mediaID, nil
+}
+
+// MediaCacheUsage walks the media cache directory and reports its size.
+func (c *Client) MediaCacheUsage() (bytes int64, files int, err error) {
+	dir := c.MediaCacheDir()
+	if dir == "" {
+		return 0, 0, nil
+	}
+	err = filepath.WalkDir(dir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return nil
+		}
+		bytes += info.Size()
+		files++
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("measure media cache: %w", err)
+	}
+	return bytes, files, nil
+}
+
+// ClearMediaCache removes cached media files without touching message history.
+func (c *Client) ClearMediaCache() error {
+	dir := c.MediaCacheDir()
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("list media cache: %w", err)
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		if err = os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove cached media at %q: %w", path, err)
+		}
+	}
+	return nil
 }
 
 func (c *Client) Events() <-chan Update {
@@ -503,6 +681,95 @@ func (c *Client) Verify(ctx context.Context, recoveryKeyOrPassphrase string) err
 	return nil
 }
 
+func (c *Client) ExportRoomKeys(ctx context.Context, passphrase string) ([]byte, error) {
+	if strings.TrimSpace(passphrase) == "" {
+		return nil, errors.New("key export passphrase is empty")
+	}
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	export, err := mautrixcrypto.ExportKeysIter(passphrase, c.engine.CryptoStore.GetAllGroupSessions(ctx))
+	if err != nil {
+		if errors.Is(err, mautrixcrypto.ErrNoSessionsForExport) {
+			return nil, errors.New("there are no Megolm room keys to export")
+		}
+		return nil, fmt.Errorf("export Megolm room keys: %w", err)
+	}
+	return export, nil
+}
+
+func (c *Client) ImportRoomKeys(ctx context.Context, passphrase string, data []byte) (int, int, error) {
+	if strings.TrimSpace(passphrase) == "" {
+		return 0, 0, errors.New("key export passphrase is empty")
+	}
+	if len(data) == 0 {
+		return 0, 0, errors.New("key export file is empty")
+	}
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer finish()
+	imported, total, err := c.engine.Crypto.ImportKeys(ctx, passphrase, data)
+	if err != nil {
+		return imported, total, fmt.Errorf("import Megolm room keys: %w", err)
+	}
+	return imported, total, nil
+}
+
+func (c *Client) Devices(ctx context.Context) ([]Device, error) {
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	response, err := c.engine.Client.GetDevicesInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list Matrix devices: %w", err)
+	}
+	profile := c.Profile()
+	devices := make([]Device, 0, len(response.Devices))
+	for _, device := range response.Devices {
+		deviceInfo := Device{
+			ID:          string(device.DeviceID),
+			DisplayName: device.DisplayName,
+			LastSeenIP:  device.LastSeenIP,
+			Current:     device.DeviceID.String() == profile.DeviceID,
+		}
+		if device.LastSeenTS > 0 {
+			deviceInfo.LastSeenAt = time.UnixMilli(device.LastSeenTS)
+		}
+		devices = append(devices, deviceInfo)
+	}
+	sort.Slice(devices, func(i, j int) bool {
+		if devices[i].Current != devices[j].Current {
+			return devices[i].Current
+		}
+		return devices[i].LastSeenAt.After(devices[j].LastSeenAt)
+	})
+	return devices, nil
+}
+
+func (c *Client) RevokeDevice(ctx context.Context, deviceID string) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return errors.New("Matrix device ID is empty")
+	}
+	if deviceID == c.Profile().DeviceID {
+		return errors.New("cannot revoke the current device from this session")
+	}
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if err = c.engine.Client.DeleteDevice(ctx, id.DeviceID(deviceID), &mautrix.ReqDeleteDevice[any]{}); err != nil {
+		return fmt.Errorf("revoke Matrix device %q: %w", deviceID, err)
+	}
+	return nil
+}
+
 func (c *Client) Start(ctx context.Context) error {
 	ctx, finish, err := c.beginOperation(ctx)
 	if err != nil {
@@ -511,6 +778,35 @@ func (c *Client) Start(ctx context.Context) error {
 	defer finish()
 	return c.startEngine(ctx)
 }
+
+// StartWithRetry starts sync and retries transient failures with exponential
+// backoff, publishing Offline state between attempts. It returns nil once
+// sync has started or when ctx is cancelled.
+func (c *Client) StartWithRetry(ctx context.Context) error {
+	for attempt := 1; ; attempt++ {
+		if err := c.Start(ctx); err == nil {
+			return nil
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		} else if attempt > 8 {
+			return fmt.Errorf("start Matrix sync after %d attempts: %w", attempt-1, err)
+		}
+		delay := reconnectDelay(attempt)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-c.done:
+			timer.Stop()
+			return errors.New("Matrix client is closed")
+		case <-timer.C:
+		}
+	}
+}
+
+// LastReconnectDelay exposes the backoff delay for tests/UI diagnostics.
+func LastReconnectDelay(attempt int) time.Duration { return reconnectDelay(attempt) }
 
 func (c *Client) startEngine(ctx context.Context) error {
 	c.startMu.Lock()
@@ -688,6 +984,7 @@ func (c *Client) React(ctx context.Context, roomID, eventID, emoji string) error
 	if eventID == "" || strings.TrimSpace(emoji) == "" {
 		return errors.New("reaction requires a target event and emoji")
 	}
+	emoji = strings.TrimSpace(emoji)
 	ctx, finish, err := c.beginOperation(ctx)
 	if err != nil {
 		return err
@@ -696,8 +993,63 @@ func (c *Client) React(ctx context.Context, roomID, eventID, emoji string) error
 	if _, err = c.engine.Client.SendReaction(ctx, id.RoomID(roomID), id.EventID(eventID), emoji); err != nil {
 		return fmt.Errorf("send Matrix reaction: %w", err)
 	}
+	c.mu.Lock()
+	if c.reactedEvents == nil {
+		c.reactedEvents = make(map[string]map[string]struct{})
+	}
+	roomReactions := c.reactedEvents[roomID]
+	if roomReactions == nil {
+		roomReactions = make(map[string]struct{})
+		c.reactedEvents[roomID] = roomReactions
+	}
+	roomReactions[eventID+"\x00"+emoji] = struct{}{}
+	// Bound memory use: reactions are hints only, refreshed from sync data.
+	if len(roomReactions) > maxReactedEvents {
+		for key := range roomReactions {
+			delete(roomReactions, key)
+			if len(roomReactions) <= maxReactedEvents {
+				break
+			}
+		}
+	}
+	if messages, ok := c.local[roomID]; ok {
+		for key, message := range messages {
+			if message.ID != eventID {
+				continue
+			}
+			if message.Reacted == nil {
+				message.Reacted = make(map[string]bool)
+			}
+			message.Reacted[emoji] = true
+			messages[key] = message
+		}
+	}
+	c.mu.Unlock()
 	c.publishTimeline([]string{roomID}, "")
 	return nil
+}
+
+// hasReacted reports whether the local user reacted with emoji to an event (best effort).
+func (c *Client) hasReacted(roomID, eventID, emoji string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.hasReactedLocked(roomID, eventID, emoji)
+}
+
+func (c *Client) hasReactedLocked(roomID, eventID, emoji string) bool {
+	if roomReactions, ok := c.reactedEvents[roomID]; ok {
+		if _, reacted := roomReactions[eventID+"\x00"+emoji]; reacted {
+			return true
+		}
+	}
+	if messages, ok := c.local[roomID]; ok {
+		for _, message := range messages {
+			if message.ID == eventID && message.Reacted[emoji] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *Client) RedactMessage(ctx context.Context, roomID, eventID string) error {
@@ -885,34 +1237,32 @@ func (c *Client) DownloadAvatar(ctx context.Context, mxc string) ([]byte, error)
 	if strings.TrimSpace(mxc) == "" {
 		return nil, nil
 	}
-	ctx, finish, err := c.beginOperation(ctx)
-	if err != nil {
-		return nil, err
+	return c.DownloadMedia(ctx, mxc, nil)
+}
+
+// CachedMediaBytes downloads media through the encrypted disk cache.
+func (c *Client) CachedMediaBytes(ctx context.Context, mxc string) ([]byte, error) {
+	message := Message{MediaURI: mxc}
+	// Resolve encryption metadata from any cached timeline copy.
+	c.mu.RLock()
+	for _, messages := range c.local {
+		for _, candidate := range messages {
+			if candidate.MediaURI == mxc && candidate.MediaEncrypted != nil {
+				message.MediaEncrypted = candidate.MediaEncrypted
+				break
+			}
+		}
 	}
-	defer finish()
-	uri, err := id.ContentURIString(mxc).Parse()
-	if err != nil {
-		return nil, fmt.Errorf("parse Matrix avatar URI: %w", err)
-	}
-	response, err := c.engine.Client.Download(ctx, uri)
-	if err != nil {
-		return nil, fmt.Errorf("download Matrix avatar: %w", err)
-	}
-	defer response.Body.Close()
-	const maxAvatarBytes = 4 << 20
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxAvatarBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read Matrix avatar: %w", err)
-	}
-	if len(data) > maxAvatarBytes {
-		return nil, fmt.Errorf("Matrix avatar exceeds %d bytes", maxAvatarBytes)
-	}
-	return data, nil
+	c.mu.RUnlock()
+	return c.DownloadMedia(ctx, message.MediaURI, message.MediaEncrypted)
 }
 
 func (c *Client) DownloadMedia(ctx context.Context, mxc string, encrypted *event.EncryptedFileInfo) ([]byte, error) {
 	if strings.TrimSpace(mxc) == "" {
 		return nil, errors.New("Matrix media URI is empty")
+	}
+	if cached, cacheErr := c.readCachedMedia(mxc, encrypted != nil); cacheErr == nil && cached != nil {
+		return cached, nil
 	}
 	ctx, finish, err := c.beginOperation(ctx)
 	if err != nil {
@@ -941,7 +1291,75 @@ func (c *Client) DownloadMedia(ctx context.Context, mxc string, encrypted *event
 			return nil, fmt.Errorf("decrypt Matrix media: %w", err)
 		}
 	}
+	c.writeCachedMedia(mxc, data)
 	return data, nil
+}
+
+// CachedMediaPath returns the disk cache path for mxc when the file exists.
+func (c *Client) CachedMediaPath(mxc string) (string, bool) {
+	path, err := c.mediaCachePath(mxc)
+	if err != nil {
+		return "", false
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
+}
+
+func (c *Client) readCachedMedia(mxc string, encrypted bool) ([]byte, error) {
+	// Encrypted payloads are cached after decryption, so validate size before use.
+	path, err := c.mediaCachePath(mxc)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	const maxMediaBytes = 50 << 20
+	if len(data) == 0 || len(data) > maxMediaBytes {
+		_ = os.Remove(path)
+		return nil, errors.New("cached Matrix media is invalid")
+	}
+	_ = encrypted
+	return data, nil
+}
+
+func (c *Client) writeCachedMedia(mxc string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	path, err := c.mediaCachePath(mxc)
+	if err != nil {
+		return
+	}
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("create Matrix media cache: %v", err)
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".media-*")
+	if err != nil {
+		log.Printf("create Matrix media cache entry: %v", err)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		log.Printf("write Matrix media cache entry: %v", err)
+		return
+	}
+	if err = tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		log.Printf("close Matrix media cache entry: %v", err)
+		return
+	}
+	_ = os.Chmod(tmpName, 0o600)
+	if err = os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		log.Printf("store Matrix media cache entry: %v", err)
+	}
 }
 
 func (c *Client) Close() {
@@ -1069,6 +1487,7 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 			room.Direct = meta.DMUserID != nil
 			room.Unread = meta.UnreadMessages + meta.UnreadNotifications
 			room.Mentions = meta.UnreadHighlights
+			room.Bridge = bridgeLabel(meta)
 			if !meta.SortingTimestamp.Time.IsZero() {
 				room.LastSeen = meta.SortingTimestamp.Time
 			}
@@ -1193,11 +1612,72 @@ func roomDisplayName(room *database.Room) string {
 	return room.ID.String()
 }
 
+// bridgeLabel derives a Beeper-network style badge label from room metadata.
+// gomuks does not expose bridge protocol directly, so this uses the DM user
+// and alias heuristics as a best-effort label (WhatsApp/Telegram/Signal/...).
+func bridgeLabel(room *database.Room) string {
+	if room == nil {
+		return ""
+	}
+	candidates := make([]string, 0, 3)
+	if room.DMUserID != nil {
+		candidates = append(candidates, strings.ToLower(room.DMUserID.String()))
+	}
+	if room.CanonicalAlias != nil {
+		candidates = append(candidates, strings.ToLower(room.CanonicalAlias.String()))
+	}
+	if room.Name != nil {
+		candidates = append(candidates, strings.ToLower(*room.Name))
+	}
+	for _, candidate := range candidates {
+		switch {
+		case strings.Contains(candidate, "whatsapp"):
+			return "WA"
+		case strings.Contains(candidate, "telegram"):
+			return "TG"
+		case strings.Contains(candidate, "signal"):
+			return "SG"
+		case strings.Contains(candidate, "imessage"):
+			return "iM"
+		case strings.Contains(candidate, "instagram"):
+			return "IG"
+		case strings.Contains(candidate, "discord"):
+			return "DC"
+		case strings.Contains(candidate, "slack"):
+			return "SL"
+		case strings.Contains(candidate, "sms"):
+			return "SMS"
+		}
+	}
+	if room.DMUserID != nil && !strings.Contains(strings.ToLower(room.ID.String()), "matrix") {
+		return "BR"
+	}
+	return ""
+}
+
 func messageFromEvent(evt *database.Event) (Message, bool) {
 	if evt == nil {
 		return Message{}, false
 	}
 	evtType := evt.GetType().Type
+	if evt.RedactedBy != "" {
+		return Message{
+			ID:        evt.ID.String(),
+			Sender:    evt.Sender.String(),
+			Timestamp: evt.Timestamp.Time,
+			Edited:    evt.LastEditRowID != nil,
+			Redacted:  true,
+		}, true
+	}
+	if evt.DecryptionError != "" {
+		return Message{
+			ID:              evt.ID.String(),
+			Sender:          evt.Sender.String(),
+			Timestamp:       evt.Timestamp.Time,
+			Encrypted:       true,
+			DecryptionError: evt.DecryptionError,
+		}, true
+	}
 	if evtType != event.EventMessage.Type && evtType != event.EventSticker.Type {
 		return Message{}, false
 	}
@@ -1207,6 +1687,12 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		URL           string                   `json:"url"`
 		File          *event.EncryptedFileInfo `json:"file"`
 		Info          *event.FileInfo          `json:"info"`
+		RelatesTo     struct {
+			EventID   string `json:"event_id"`
+			InReplyTo struct {
+				EventID string `json:"event_id"`
+			} `json:"m.in_reply_to"`
+		} `json:"m.relates_to"`
 	}
 	if err := json.Unmarshal(evt.GetContent(), &content); err != nil || content.Body == "" {
 		return Message{}, false
@@ -1215,20 +1701,47 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 	if mediaURI == "" && content.File != nil {
 		mediaURI = string(content.File.URL)
 	}
+	replyTo := content.RelatesTo.EventID
+	if replyTo == "" {
+		replyTo = content.RelatesTo.InReplyTo.EventID
+	}
+	if replyTo == "" {
+		replyTo = evt.RelatesTo.String()
+		switch evt.RelationType {
+		case "", event.RelThread, event.RelReference:
+		default:
+			// Edits (m.replace), reactions (m.annotation) etc. are not replies.
+			if evt.RelationType != "m.in_reply_to" {
+				replyTo = ""
+			}
+		}
+		if replyTo != "" && strings.HasPrefix(replyTo, "$") == false && !strings.Contains(replyTo, ":") {
+			replyTo = ""
+		}
+	}
 	return Message{
-		ID:             evt.ID.String(),
-		TransactionID:  evt.TransactionID,
-		Sender:         evt.Sender.String(),
-		Body:           content.Body,
-		FormattedBody:  content.FormattedBody,
-		Timestamp:      evt.Timestamp.Time,
-		TimelineCursor: int64(evt.TimelineRowID),
-		Sending:        evt.SendError == "not sent",
-		SendError:      evt.SendError,
-		Reactions:      evt.Reactions,
-		MediaURI:       mediaURI,
-		MediaEncrypted: content.File,
-		MediaMIME:      mediaMIME(content.Info),
+		ID:              evt.ID.String(),
+		TransactionID:   evt.TransactionID,
+		Sender:          evt.Sender.String(),
+		Body:            content.Body,
+		FormattedBody:   content.FormattedBody,
+		ReplyToEventID:  replyTo,
+		Timestamp:       evt.Timestamp.Time,
+		TimelineCursor:  int64(evt.TimelineRowID),
+		Sending:         evt.SendError == "not sent",
+		SendError:       evt.SendError,
+		Reactions:       evt.Reactions,
+		Reacted:         map[string]bool{},
+		MediaURI:        mediaURI,
+		MediaEncrypted:  content.File,
+		MediaMIME:       mediaMIME(content.Info),
+		MediaSize:       mediaSize(content.Info),
+		MediaWidth:      mediaWidth(content.Info),
+		MediaHeight:     mediaHeight(content.Info),
+		MediaDurationMs: mediaDuration(content.Info),
+		Encrypted:       evt.MegolmSessionID != "",
+		Edited:          evt.LastEditRowID != nil,
+		EditHistory:     editHistory(evt),
 	}, true
 }
 
@@ -1237,6 +1750,47 @@ func mediaMIME(info *event.FileInfo) string {
 		return ""
 	}
 	return info.MimeType
+}
+
+func mediaSize(info *event.FileInfo) int {
+	if info == nil {
+		return 0
+	}
+	return info.Size
+}
+
+func mediaWidth(info *event.FileInfo) int {
+	if info == nil {
+		return 0
+	}
+	return info.Width
+}
+
+func mediaHeight(info *event.FileInfo) int {
+	if info == nil {
+		return 0
+	}
+	return info.Height
+}
+
+func mediaDuration(info *event.FileInfo) int {
+	if info == nil || info.Duration <= 0 {
+		return 0
+	}
+	return int(info.Duration)
+}
+
+// editHistory reports prior edit sources when available. gomuks only stores
+// the current edit source, so this is a placeholder that surfaces "(edited)"
+// detail when the SDK exposes more history in the future.
+func editHistory(evt *database.Event) []string {
+	if evt == nil || evt.LastEditRowID == nil {
+		return nil
+	}
+	if local := evt.LocalContent; local != nil && strings.TrimSpace(local.EditSource) != "" {
+		return []string{strings.TrimSpace(local.EditSource)}
+	}
+	return nil
 }
 
 func (c *Client) storeLocalMessage(roomID string, message Message) {

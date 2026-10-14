@@ -97,6 +97,17 @@ func TestShouldGroupConsecutiveMessages(t *testing.T) {
 	}
 }
 
+func TestMessageTimestampSupportsRelativeAndAbsoluteModes(t *testing.T) {
+	now := time.Date(2026, time.October, 14, 17, 0, 0, 0, time.Local)
+	timestamp := now.Add(-90 * time.Minute)
+	if got := messageTimestamp(timestamp, "15:04", false, now); got != timestamp.Format("15:04") {
+		t.Fatalf("absolute timestamp = %q", got)
+	}
+	if got := messageTimestamp(timestamp, "15:04", true, now); got != "1h ago" {
+		t.Fatalf("relative timestamp = %q, want 1h ago", got)
+	}
+}
+
 func TestChatViewExplainsMessageLoadingAndEmptyHistory(t *testing.T) {
 	view := NewChatView(nil)
 	view.SetRoom(matrix.Room{ID: "!room:example.org", Name: "Room"})
@@ -148,7 +159,40 @@ func TestComposerCtrlEnterModeKeepsPlainEnterAsNewline(t *testing.T) {
 	if sent != "" || view.input.Text != "first\n" {
 		t.Fatalf("plain Enter in Ctrl+Enter mode: sent %q, text %q", sent, view.input.Text)
 	}
+
 	if view.input.PlaceHolder != "Write a message... (Ctrl+Enter to send, Enter for a new line)" {
 		t.Fatalf("Ctrl+Enter placeholder = %q", view.input.PlaceHolder)
+	}
+}
+
+func TestComposerEditsMessageThroughInlineBanner(t *testing.T) {
+	view := NewChatView(nil)
+	view.SetRoom(matrix.Room{ID: "!room:example.org"})
+	var gotRoom, gotText, gotEvent string
+	view.SetEditSendHandler(func(roomID, text, eventID string) {
+		gotRoom, gotText, gotEvent = roomID, text, eventID
+	})
+	message := matrix.Message{ID: "$event", Body: "original"}
+	view.BeginEdit(message)
+	if !view.editLabel.Visible() || view.input.Text != "original" {
+		t.Fatalf("edit mode banner visible=%v, composer=%q", view.editLabel.Visible(), view.input.Text)
+	}
+	view.input.SetText("updated")
+	view.submit()
+	if gotRoom != "!room:example.org" || gotText != "updated" || gotEvent != "$event" {
+		t.Fatalf("edit callback got (%q, %q, %q)", gotRoom, gotText, gotEvent)
+	}
+	if view.editLabel.Visible() || view.input.Text != "" {
+		t.Fatal("successful edit submission should close the edit banner and clear the composer")
+	}
+}
+
+func TestCancelEditClearsDraftAndBanner(t *testing.T) {
+	view := NewChatView(nil)
+	view.SetRoom(matrix.Room{ID: "!room:example.org"})
+	view.BeginEdit(matrix.Message{ID: "$event", Body: "original"})
+	view.cancelEdit()
+	if view.editLabel.Visible() || view.input.Text != "" {
+		t.Fatalf("cancel left edit banner=%v and composer=%q", view.editLabel.Visible(), view.input.Text)
 	}
 }

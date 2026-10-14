@@ -101,7 +101,10 @@ func NewRoomList(onSelect func(matrix.Room)) *RoomList {
 			preview := widget.NewLabel("")
 			preview.Truncation = fyne.TextTruncateEllipsis
 			badge := widget.NewLabel("")
-			return container.NewHBox(avatar.root, container.NewVBox(name, preview), badge)
+			unreadDot := widget.NewLabel("●")
+			unreadDot.Hide()
+			network := widget.NewLabel("")
+			return container.NewHBox(avatar.root, container.NewVBox(name, preview), network, unreadDot, badge)
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
 			if id < 0 || id >= len(rooms.visible) {
@@ -123,7 +126,20 @@ func NewRoomList(onSelect func(matrix.Room)) *RoomList {
 				preview = "Muted · " + preview
 			}
 			rowLabels.Objects[1].(*widget.Label).SetText(preview)
-			badge := row.Objects[2].(*widget.Label)
+			network := row.Objects[2].(*widget.Label)
+			if item.Bridge != "" {
+				network.SetText("[" + item.Bridge + "]")
+				network.Show()
+			} else {
+				network.Hide()
+			}
+			unreadDot := row.Objects[3].(*widget.Label)
+			if item.Unread > 0 && item.Mentions == 0 {
+				unreadDot.Show()
+			} else {
+				unreadDot.Hide()
+			}
+			badge := row.Objects[4].(*widget.Label)
 			if item.Mentions > 0 {
 				badge.SetText(fmt.Sprintf("%d", item.Mentions))
 			} else if item.Unread > 0 {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestMessageFromEventMapsMediaMetadata(t *testing.T) {
 	}{
 		{
 			name:    "unencrypted",
-			content: `{"body":"photo","url":"mxc://example.org/plain","info":{"mimetype":"image/png"}}`,
+			content: `{"body":"photo","url":"mxc://example.org/plain","info":{"mimetype":"image/png","w":640,"h":480}}`,
 			wantURI: "mxc://example.org/plain",
 		},
 		{
@@ -77,6 +78,51 @@ func TestMessageFromEventMapsMediaMetadata(t *testing.T) {
 			}
 			if !test.encrypted && message.MediaMIME != "image/png" {
 				t.Errorf("media MIME = %q, want image/png", message.MediaMIME)
+			}
+			if !test.encrypted && (message.MediaWidth != 640 || message.MediaHeight != 480) {
+				t.Errorf("media dimensions = %dx%d, want 640x480", message.MediaWidth, message.MediaHeight)
+			}
+		})
+	}
+}
+
+func TestMessageFromEventIncludesEditRedactionAndDecryptionStatus(t *testing.T) {
+	editedRow := database.EventRowID(2)
+	tests := []struct {
+		name           string
+		event          *database.Event
+		wantBody       string
+		wantEdited     bool
+		wantRedacted   bool
+		wantDecryption string
+	}{
+		{
+			name:       "edited",
+			event:      &database.Event{ID: "$edited", Type: event.EventMessage.Type, Content: json.RawMessage(`{"body":"updated"}`), LastEditRowID: &editedRow},
+			wantBody:   "updated",
+			wantEdited: true,
+		},
+		{
+			name:         "redacted",
+			event:        &database.Event{ID: "$redacted", Type: event.EventMessage.Type, RedactedBy: "$redaction"},
+			wantEdited:   false,
+			wantRedacted: true,
+		},
+		{
+			name:           "decryption failure",
+			event:          &database.Event{ID: "$encrypted", Type: event.EventEncrypted.Type, DecryptionError: "missing room key"},
+			wantDecryption: "missing room key",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message, ok := messageFromEvent(test.event)
+			if !ok {
+				t.Fatal("expected event to be represented in the timeline")
+			}
+			if message.Body != test.wantBody || message.Edited != test.wantEdited ||
+				message.Redacted != test.wantRedacted || message.DecryptionError != test.wantDecryption {
+				t.Fatalf("unexpected event status: %+v", message)
 			}
 		})
 	}
@@ -339,6 +385,87 @@ func TestNewInitializesAndReopensLocalDatabase(t *testing.T) {
 		t.Fatalf("reopen client: %v", err)
 	}
 	client.Close()
+}
+
+func TestReconnectDelayDoublesAndCaps(t *testing.T) {
+	got := []time.Duration{
+		LastReconnectDelay(0),
+		LastReconnectDelay(1),
+		LastReconnectDelay(2),
+		LastReconnectDelay(5),
+		LastReconnectDelay(6),
+		LastReconnectDelay(20),
+	}
+	want := []time.Duration{time.Second, time.Second, 2 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reconnect delay[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseMXCRejectsInvalidURIs(t *testing.T) {
+	server, mediaID, err := parseMXC("mxc://example.org/media123")
+	if err != nil || server != "example.org" || mediaID != "media123" {
+		t.Fatalf("parse mxc = (%q, %q, %v)", server, mediaID, err)
+	}
+	for _, invalid := range []string{"", "https://example.org/x", "mxc://", "mxc://server/", "mxc:///id", "mxc://s/a/b"} {
+		if _, _, err = parseMXC(invalid); err == nil {
+			t.Fatalf("expected error for %q", invalid)
+		}
+	}
+}
+
+func TestMediaCacheUsageAndClear(t *testing.T) {
+	client := &Client{mediaCacheDir: filepath.Join(t.TempDir(), "media")}
+	if err := os.MkdirAll(client.MediaCacheDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(client.MediaCacheDir(), "a"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(client.MediaCacheDir(), "b"), []byte("world!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bytes, files, err := client.MediaCacheUsage()
+	if err != nil || files != 2 || bytes != 11 {
+		t.Fatalf("media usage = (%d, %d, %v)", bytes, files, err)
+	}
+	if path, err := client.mediaCachePath("mxc://example.org/media123"); err != nil || !strings.HasPrefix(path, client.MediaCacheDir()) {
+		t.Fatalf("media cache path = %q, %v", path, err)
+	}
+	if err := client.ClearMediaCache(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := client.MediaCacheUsage(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBridgeLabelDetectsNetworks(t *testing.T) {
+	name := "WhatsApp Bridge"
+	client := &Client{}
+	_ = client
+	room := roomForBridgeTest(&name, "@_whatsapp_user:example.org")
+	if got := bridgeLabel(room); got != "WA" {
+		t.Fatalf("bridge = %q, want WA", got)
+	}
+	plain := roomForBridgeTest(nil, "")
+	if got := bridgeLabel(plain); got != "" {
+		t.Fatalf("plain bridge = %q, want empty", got)
+	}
+	if got := bridgeLabel(nil); got != "" {
+		t.Fatalf("nil bridge = %q, want empty", got)
+	}
+}
+
+func roomForBridgeTest(name *string, dmUser string) *database.Room {
+	room := &database.Room{ID: "!room:example.org", Name: name}
+	if dmUser != "" {
+		dm := id.UserID(dmUser)
+		room.DMUserID = &dm
+	}
+	return room
 }
 
 func stringPointer(value string) *string {
