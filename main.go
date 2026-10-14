@@ -10,6 +10,12 @@ import (
 	"mychat/ui"
 )
 
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildDate = "unknown"
+)
+
 func main() {
 	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
 		log.Print("no graphical display found; in the VNC desktop run `export DISPLAY=:1` before starting Matrix")

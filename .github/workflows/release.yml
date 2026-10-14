@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-assets:
+    name: Prepare application icon
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Render application icon
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes librsvg2-bin
+          mkdir -p dist
+          rsvg-convert --width 1024 --height 1024 --output dist/gomuks-desktop.png assets/gomuks-desktop.svg
+
+      - name: Upload application icon
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-icon
+          path: dist/gomuks-desktop.png
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    needs: prepare-assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+            architecture: amd64
+            artifact: app-windows-amd64.zip
+          - platform: linux
+            runner: ubuntu-latest
+            architecture: amd64
+            artifact: app-linux-amd64.tar.gz
+          - platform: linux
+            runner: ubuntu-24.04-arm
+            architecture: arm64
+            artifact: app-linux-arm64.tar.gz
+          - platform: macos
+            runner: macos-latest
+            architecture: universal
+            artifact: app-macos-universal.zip
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download application icon
+        uses: actions/download-artifact@v4
+        with:
+          name: application-icon
+          path: build-assets
+
+      - name: Install ImageMagick
+        if: runner.os == 'Windows'
+        run: choco install imagemagick --yes --no-progress
+
+      - name: Install Windows C compiler
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc zip
+
+      - name: Install Linux desktop development libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgl1-mesa-dev xorg-dev
+
+      - name: Prepare build metadata
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          mkdir -p dist
+
+      - name: Build Windows executable
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          magick build-assets/gomuks-desktop.png -define icon:auto-resize=256,128,64,48,32,16 dist/gomuks-desktop.ico
+          go install github.com/akavel/rsrc@latest
+          rsrc -manifest assets/windows.manifest -ico dist/gomuks-desktop.ico -o rsrc_windows_amd64.syso
+          go build -tags "sqlite_fts5 goolm" \
+            -ldflags "-s -w -H=windowsgui -X main.Version=${VERSION} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=${BUILD_DATE} -X mychat/ui.Version=${VERSION} -X mychat/ui.Commit=${GITHUB_SHA} -X mychat/ui.BuildDate=${BUILD_DATE}" \
+            -o dist/gomuks-desktop.exe .
+          cp assets/gomuks-desktop.svg dist/
+          rm rsrc_windows_amd64.syso
+
+      - name: Package Windows executable
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/gomuks-desktop.exe,dist/gomuks-desktop.svg -DestinationPath dist/app-windows-amd64.zip
+
+      - name: Build Linux executable
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          docker run --rm \
+            --platform "linux/${ARCHITECTURE}" \
+            -v "$PWD:/src" -w /src \
+            -e VERSION -e BUILD_DATE -e GITHUB_SHA -e ARCHITECTURE \
+            golang:1.26-bullseye bash -ec '
+              apt-get update
+              apt-get install --yes gcc libgl1-mesa-dev xorg-dev
+              CGO_ENABLED=1 GOOS=linux GOARCH="$ARCHITECTURE" go build \
+                -tags "x11 sqlite_fts5 goolm" \
+                -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=${BUILD_DATE} -X mychat/ui.Version=${VERSION} -X mychat/ui.Commit=${GITHUB_SHA} -X mychat/ui.BuildDate=${BUILD_DATE}" \
+                -o dist/gomuks-desktop .
+            '
+          mkdir -p dist/share/icons/hicolor/scalable/apps dist/share/icons/hicolor/1024x1024/apps
+          cp assets/gomuks-desktop.svg dist/share/icons/hicolor/scalable/apps/gomuks-desktop.svg
+          cp build-assets/gomuks-desktop.png dist/share/icons/hicolor/1024x1024/apps/gomuks-desktop.png
+          cat > dist/gomuks-desktop.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Gomuks Desktop
+          Exec=gomuks-desktop
+          Icon=gomuks-desktop
+          Categories=Network;InstantMessaging;
+          Terminal=false
+          EOF
+          tar -czf "dist/${{ matrix.artifact }}" -C dist gomuks-desktop gomuks-desktop.desktop share
+
+      - name: Build universal macOS app
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          mkdir -p "dist/Gomuks Desktop.app/Contents/MacOS" "dist/Gomuks Desktop.app/Contents/Resources" "dist/Gomuks Desktop.iconset"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" build-assets/gomuks-desktop.png \
+              --out "dist/Gomuks Desktop.iconset/icon_${size}x${size}.png" >/dev/null
+          done
+          for size in 16 32 128 256 512; do
+            double=$((size * 2))
+            sips -z "$double" "$double" build-assets/gomuks-desktop.png \
+              --out "dist/Gomuks Desktop.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "dist/Gomuks Desktop.iconset" \
+            -o "dist/Gomuks Desktop.app/Contents/Resources/AppIcon.icns"
+          for arch in amd64 arm64; do
+            clang_arch="$arch"
+            if [ "$arch" = amd64 ]; then clang_arch=x86_64; fi
+            CC="clang -arch $clang_arch" CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" go build \
+              -tags "sqlite_fts5 goolm" \
+              -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=${BUILD_DATE} -X mychat/ui.Version=${VERSION} -X mychat/ui.Commit=${GITHUB_SHA} -X mychat/ui.BuildDate=${BUILD_DATE}" \
+              -o "dist/gomuks-desktop-${arch}" .
+          done
+          lipo -create dist/gomuks-desktop-amd64 dist/gomuks-desktop-arm64 \
+            -output "dist/Gomuks Desktop.app/Contents/MacOS/gomuks-desktop"
+          cat > "dist/Gomuks Desktop.app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>gomuks-desktop</string>
+            <key>CFBundleIdentifier</key><string>fi.mau.gomuks-desktop</string>
+            <key>CFBundleName</key><string>Gomuks Desktop</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${GITHUB_RUN_NUMBER}</string>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "dist/Gomuks Desktop.app"
+          ditto -c -k --keepParent "dist/Gomuks Desktop.app" dist/app-macos-universal.zip
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum app-windows-amd64.zip app-linux-amd64.tar.gz app-linux-arm64.tar.gz app-macos-universal.zip > checksums.txt
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/app-windows-amd64.zip
+            dist/app-linux-amd64.tar.gz
+            dist/app-linux-arm64.tar.gz
+            dist/app-macos-universal.zip
+            dist/checksums.txt

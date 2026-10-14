@@ -25,6 +25,7 @@ type ChatView struct {
 	loadOlder  *widget.Button
 	replyLabel *widget.Label
 	attach     *widget.Button
+	emoji      *widget.Button
 	completion *widget.Select
 	favorite   *widget.Button
 	mute       *widget.Button
@@ -37,6 +38,7 @@ type ChatView struct {
 	avatars         *avatarCache
 	messageAvatars  map[*fyne.Container]*avatarView
 	retryButtons    map[*fyne.Container]*widget.Button
+	downloadButtons map[*fyne.Container]*widget.Button
 	onSend          func(roomID, text string)
 	onSendMentions  func(roomID, text string, userIDs []string)
 	onRetry         func(roomID, transactionID string)
@@ -50,6 +52,8 @@ type ChatView struct {
 	onSearch        func(roomID string)
 	onLeave         func(roomID string)
 	onAttach        func(roomID string)
+	onEmoji         func()
+	onDownload      func(matrix.Message)
 	onFavorite      func(roomID string)
 	onMute          func(roomID string)
 	typingTimer     *time.Timer
@@ -66,6 +70,18 @@ type ChatView struct {
 	members         []matrix.Member
 	completions     []completionOption
 	mentionNames    map[string]string
+	showAvatars     bool
+	time24Hour      bool
+}
+
+func (v *ChatView) SetShowAvatars(show bool) {
+	v.showAvatars = show
+	v.messages.Refresh()
+}
+
+func (v *ChatView) Set24HourTime(enabled bool) {
+	v.time24Hour = enabled
+	v.messages.Refresh()
 }
 
 type completionOption struct {
@@ -100,6 +116,15 @@ func (v *ChatView) SetTypingHandler(handler func(roomID, text string)) {
 	v.onTyping = handler
 }
 
+func (v *ChatView) SetSendOnCtrlEnter(enabled bool) {
+	v.input.sendOnCtrlEnter = enabled
+	if enabled {
+		v.input.SetPlaceHolder("Write a message... (Ctrl+Enter to send, Enter for a new line)")
+	} else {
+		v.input.SetPlaceHolder("Write a message... (Enter to send, Shift+Enter for a new line)")
+	}
+}
+
 func (v *ChatView) SetSearchHandler(handler func(roomID string)) {
 	v.onSearch = handler
 }
@@ -110,6 +135,15 @@ func (v *ChatView) SetLeaveHandler(handler func(roomID string)) {
 
 func (v *ChatView) SetAttachmentHandler(handler func(roomID string)) {
 	v.onAttach = handler
+}
+
+func (v *ChatView) SetEmojiHandler(handler func()) {
+	v.onEmoji = handler
+}
+
+func (v *ChatView) SetDownloadHandler(handler func(matrix.Message)) {
+	v.onDownload = handler
+	v.messages.Refresh()
 }
 
 func (v *ChatView) SetMentionSendHandler(handler func(roomID, text string, userIDs []string)) {
@@ -128,16 +162,18 @@ func (v *ChatView) SetRoomPreferenceHandlers(favorite, mute func(roomID string))
 
 func NewChatView(onSend func(roomID, text string)) *ChatView {
 	view := &ChatView{
-		title:          widget.NewLabelWithStyle("Select a room", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		topic:          widget.NewLabel(""),
-		status:         widget.NewLabel(""),
-		typing:         widget.NewLabel(""),
-		empty:          widget.NewLabel("Select a chat to see its messages."),
-		roomAvatar:     newAvatarView(36),
-		onSend:         onSend,
-		messageAvatars: make(map[*fyne.Container]*avatarView),
-		retryButtons:   make(map[*fyne.Container]*widget.Button),
-		mentionNames:   make(map[string]string),
+		title:           widget.NewLabelWithStyle("Select a room", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		topic:           widget.NewLabel(""),
+		status:          widget.NewLabel(""),
+		typing:          widget.NewLabel(""),
+		empty:           widget.NewLabel("Select a chat to see its messages."),
+		roomAvatar:      newAvatarView(36),
+		onSend:          onSend,
+		messageAvatars:  make(map[*fyne.Container]*avatarView),
+		retryButtons:    make(map[*fyne.Container]*widget.Button),
+		downloadButtons: make(map[*fyne.Container]*widget.Button),
+		mentionNames:    make(map[string]string),
+		showAvatars:     true,
 	}
 	view.input = newComposerEntry(view.submit)
 	view.input.SetPlaceHolder("Write a message... (Enter to send, Shift+Enter for a new line)")
@@ -159,8 +195,11 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 			react := widget.NewButton("👍", nil)
 			edit := widget.NewButton("Edit", nil)
 			redact := widget.NewButton("Delete", nil)
-			row := container.NewHBox(avatar.root, container.NewVBox(details, body, reactions), retry, reply, react, edit, redact)
+			download := widget.NewButton("Download", nil)
+			download.Hide()
+			row := container.NewHBox(avatar.root, container.NewVBox(details, body, reactions), retry, reply, react, edit, redact, download)
 			view.retryButtons[row] = retry
+			view.downloadButtons[row] = download
 			return row
 		},
 		func(id widget.ListItemID, object fyne.CanvasObject) {
@@ -173,7 +212,21 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 			if senderName == "" {
 				senderName = message.Sender
 			}
-			details := fmt.Sprintf("%s | %s", senderName, message.Timestamp.Local().Format(time.Kitchen))
+			timeFormat := time.Kitchen
+			if view.time24Hour {
+				timeFormat = "15:04"
+			}
+			avatar := box.Objects[0].(*fyne.Container)
+			showSender := true
+			if id > 0 {
+				previous := view.history[id-1]
+				showSender = !shouldGroupMessages(previous, message)
+			}
+			detailsText := message.Timestamp.Local().Format(timeFormat)
+			if showSender {
+				detailsText = senderName + " | " + detailsText
+			}
+			details := detailsText
 			if message.Sending {
 				details += " | Sending..."
 			} else if message.SendError != "" {
@@ -225,13 +278,36 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 					view.onRedact(message)
 				}
 			}
-			view.messageAvatars[box.Objects[0].(*fyne.Container)].set(message.Avatar, senderName, view.avatars)
+			download := view.downloadButtons[box]
+			if message.MediaURI != "" && view.onDownload != nil {
+				if strings.HasPrefix(message.MediaMIME, "image/") {
+					download.SetText("Preview")
+				} else {
+					download.SetText("Download")
+				}
+				download.Show()
+				download.OnTapped = func() { view.onDownload(message) }
+			} else {
+				download.Hide()
+				download.OnTapped = nil
+			}
+			if view.showAvatars && showSender {
+				avatar.Show()
+				view.messageAvatars[avatar].set(message.Avatar, senderName, view.avatars)
+			} else {
+				avatar.Hide()
+			}
 		},
 	)
 	view.send = widget.NewButtonWithIcon("", theme.MailSendIcon(), view.submit)
 	view.attach = widget.NewButton("Attach", func() {
 		if view.onAttach != nil && view.room.ID != "" {
 			view.onAttach(view.room.ID)
+		}
+	})
+	view.emoji = widget.NewButton("Emoji", func() {
+		if view.onEmoji != nil {
+			view.onEmoji()
 		}
 	})
 	view.favorite = widget.NewButton("Pin", func() {
@@ -250,6 +326,7 @@ func NewChatView(onSend func(roomID, text string)) *ChatView {
 	view.completion.Hide()
 	view.input.OnChanged = func(text string) {
 		view.updateCompletions(text)
+		view.updateComposerState()
 		if view.typingTimer != nil {
 			view.typingTimer.Stop()
 		}
@@ -281,7 +358,7 @@ func (v *ChatView) Object() fyne.CanvasObject {
 		v.loadOlder,
 	), v.title)
 	header := container.NewVBox(titleBar, v.topic, v.typing, v.status, widget.NewSeparator())
-	composer := container.NewVBox(v.replyLabel, v.completion, container.NewBorder(nil, nil, v.attach, v.send, v.input))
+	composer := container.NewVBox(v.replyLabel, v.completion, container.NewBorder(nil, nil, container.NewHBox(v.attach, v.emoji), v.send, v.input))
 	bottom := composer
 	return container.NewBorder(header, bottom, nil, nil, container.NewStack(v.messages, container.NewCenter(v.empty)))
 }
@@ -304,6 +381,7 @@ func (v *ChatView) SetRoom(room matrix.Room) {
 	v.SetMessagesLoading(room.ID != "")
 	v.updateEmptyState()
 	v.updateOlderButton()
+	v.updateComposerState()
 }
 
 func (v *ChatView) UpdateRoom(room matrix.Room) {
@@ -487,6 +565,11 @@ func deduplicateMessages(messages []matrix.Message) []matrix.Message {
 	return result
 }
 
+func shouldGroupMessages(previous, current matrix.Message) bool {
+	delta := current.Timestamp.Sub(previous.Timestamp)
+	return previous.Sender == current.Sender && delta >= 0 && delta <= 5*time.Minute
+}
+
 func sortMessages(messages []matrix.Message) {
 	sort.SliceStable(messages, func(i, j int) bool {
 		if messages[i].Timestamp.Equal(messages[j].Timestamp) {
@@ -646,23 +729,46 @@ func (v *ChatView) applyCompletion(label string) {
 func (v *ChatView) setComposerEnabled(enabled bool) {
 	if enabled {
 		v.input.Enable()
-		v.send.Enable()
 		v.attach.Enable()
+		v.emoji.Enable()
 		v.favorite.Enable()
 		v.mute.Enable()
+		v.updateComposerState()
 	} else {
 		v.input.Disable()
 		v.send.Disable()
 		v.attach.Disable()
+		v.emoji.Disable()
 		v.favorite.Disable()
 		v.mute.Disable()
 	}
 }
 
+func (v *ChatView) updateComposerState() {
+	text := strings.TrimSpace(v.input.Text)
+	canSend := v.room.ID != "" && text != ""
+	if canSend {
+		v.send.Enable()
+		v.send.Importance = widget.HighImportance
+	} else {
+		v.send.Disable()
+		v.send.Importance = widget.MediumImportance
+	}
+	lineCount := strings.Count(v.input.Text, "\n") + 1
+	if lineCount < 1 {
+		lineCount = 1
+	}
+	if lineCount > 5 {
+		lineCount = 5
+	}
+	v.input.SetMinRowsVisible(lineCount)
+}
+
 type composerEntry struct {
 	*widget.Entry
-	shiftDown bool
-	onSend    func()
+	shiftDown       bool
+	sendOnCtrlEnter bool
+	onSend          func()
 }
 
 func newComposerEntry(onSend func()) *composerEntry {
@@ -690,7 +796,7 @@ func (e *composerEntry) KeyUp(key *fyne.KeyEvent) {
 }
 
 func (e *composerEntry) TypedKey(key *fyne.KeyEvent) {
-	if !e.shiftDown && (key.Name == fyne.KeyReturn || key.Name == fyne.KeyEnter) {
+	if !e.shiftDown && !e.sendOnCtrlEnter && (key.Name == fyne.KeyReturn || key.Name == fyne.KeyEnter) {
 		if e.onSend != nil {
 			e.onSend()
 		}

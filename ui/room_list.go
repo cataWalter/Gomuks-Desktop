@@ -32,6 +32,7 @@ type RoomList struct {
 	onUndo      func()
 	undoVisible bool
 	onTheme     func()
+	onSettings  func()
 	onLogout    func()
 }
 
@@ -180,9 +181,19 @@ func (r *RoomList) Object() fyne.CanvasObject {
 	title := widget.NewLabelWithStyle("Chats", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	return container.NewBorder(
 		container.NewVBox(title, r.controls),
-		container.NewHBox(widget.NewButton("Theme", r.theme), widget.NewButton("Log out", r.logout)),
+		container.NewHBox(widget.NewButton("Theme", r.theme), widget.NewButton("Settings", r.settings), widget.NewButton("Log out", r.logout)),
 		nil, nil, container.NewStack(r.list, r.empty),
 	)
+}
+
+func (r *RoomList) SetSettingsAction(settingsAction func()) {
+	r.onSettings = settingsAction
+}
+
+func (r *RoomList) settings() {
+	if r.onSettings != nil {
+		r.onSettings()
+	}
 }
 
 func (r *RoomList) SetActions(themeAction, logoutAction func()) {

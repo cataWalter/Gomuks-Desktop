@@ -42,6 +42,24 @@ func newAvatarCache(ctx context.Context, fetch avatarFetcher) *avatarCache {
 	return &avatarCache{ctx: ctx, fetch: fetch, avatars: make(map[string]*avatarResult)}
 }
 
+func (c *avatarCache) Clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	clear(c.avatars)
+	c.mu.Unlock()
+}
+
+func (c *avatarCache) Count() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.avatars)
+}
+
 func (c *avatarCache) load(uri string, callback func(image.Image)) {
 	if uri == "" || c == nil || c.fetch == nil {
 		return

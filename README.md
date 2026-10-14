@@ -39,8 +39,36 @@ Room and member profile images are downloaded from their Matrix content URIs,
 cached in memory for the current app session, and resized for display. Missing
 or unavailable images use a generated initials icon instead.
 
+The sidebar includes a persisted **Needs reply** view. Marking a room answered
+stores the latest event ID in the local SQLite database; a later incoming event
+can put the room back in that view. `E` marks the selected room answered, and
+`Ctrl+Z` / `⌘Z` restores the most recently dismissed room. Triage shortcuts are
+ignored while the message composer is focused.
+
+Open **Settings** from the sidebar or with `Ctrl+,` / `⌘,` to configure theme,
+timeline avatars and clock format, notification privacy, and the Enter-to-send
+behavior. The Storage tab reports the SQLite database/WAL size, can clear the
+in-memory avatar cache, and can run SQLite `VACUUM`. This client currently does
+not keep a disk media cache.
+
+The composer also has an emoji picker and accepts files dropped onto the window.
+Where the native desktop driver exposes a system tray, its menu can reopen the
+window, mark rooms read, or quit; an unread badge is shown when supported.
+
+Pushing a `v*` tag runs the standalone release workflow. It builds Windows
+amd64, Linux amd64/arm64, and a universal macOS app bundle, then attaches
+archives and a SHA-256 checksum file to the GitHub Release. The Windows arm64
+artifact is not currently produced.
+
 To compile and run tests without a native desktop display driver:
 
 ```sh
 go test -tags "ci sqlite_fts5 goolm" ./...
 ```
+
+Tagged versions (`v*`) trigger the GitHub Actions release workflow. It builds
+portable Windows and Linux amd64/arm64 archives plus a universal macOS app
+archive, then publishes them with a `checksums.txt` SHA-256 manifest. Linux
+releases are built against Debian Bullseye's glibc baseline. Release builds
+embed the version, commit, and build timestamp; builds outside the release
+workflow report `dev` as their version.

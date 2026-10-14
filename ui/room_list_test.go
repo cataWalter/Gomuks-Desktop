@@ -75,25 +75,6 @@ func TestRoomListFiltersByChatTypeAndQuery(t *testing.T) {
 		t.Fatalf("DM filter returned %+v", rooms.visible)
 	}
 
-	func TestRoomListNeedsReplyFilterAndAdvance(t *testing.T) {
-		rooms := NewRoomList(nil)
-		rooms.SetRooms([]matrix.Room{
-			{ID: "!one:example.org", Name: "One", Unanswered: true},
-			{ID: "!two:example.org", Name: "Two", Unanswered: false},
-			{ID: "!three:example.org", Name: "Three", Unanswered: true},
-		})
-		if rooms.unanswered.Text != "Needs reply (2)" {
-			t.Fatalf("needs-reply count label = %q", rooms.unanswered.Text)
-		}
-		rooms.setFilter(unansweredRooms)
-		if len(rooms.visible) != 2 || rooms.visible[0].ID != "!one:example.org" || rooms.visible[1].ID != "!three:example.org" {
-			t.Fatalf("needs-reply filter returned %+v", rooms.visible)
-		}
-		if next := rooms.NextVisibleRoom("!one:example.org"); next != "!three:example.org" {
-			t.Fatalf("next visible room = %q, want !three:example.org", next)
-		}
-	}
-
 	rooms.setFilter(groupRooms)
 	if len(rooms.visible) != 1 || rooms.visible[0].ID != "!group:example.org" {
 		t.Fatalf("group filter returned %+v", rooms.visible)
@@ -112,5 +93,24 @@ func TestRoomListFiltersByChatTypeAndQuery(t *testing.T) {
 	rooms.refresh()
 	if len(rooms.visible) != 0 || !rooms.empty.Visible() || rooms.empty.Text != "No chats match this search or filter." {
 		t.Fatalf("no-match state = visible %v, text %q", rooms.empty.Visible(), rooms.empty.Text)
+	}
+}
+
+func TestRoomListNeedsReplyFilterAndAdvance(t *testing.T) {
+	rooms := NewRoomList(nil)
+	rooms.SetRooms([]matrix.Room{
+		{ID: "!one:example.org", Name: "One", Unanswered: true},
+		{ID: "!two:example.org", Name: "Two", Unanswered: false},
+		{ID: "!three:example.org", Name: "Three", Unanswered: true},
+	})
+	if rooms.unanswered.Text != "Needs reply (2)" {
+		t.Fatalf("needs-reply count label = %q", rooms.unanswered.Text)
+	}
+	rooms.setFilter(unansweredRooms)
+	if len(rooms.visible) != 2 || rooms.visible[0].ID != "!one:example.org" || rooms.visible[1].ID != "!three:example.org" {
+		t.Fatalf("needs-reply filter returned %+v", rooms.visible)
+	}
+	if next := rooms.NextVisibleRoom("!one:example.org"); next != "!three:example.org" {
+		t.Fatalf("next visible room = %q, want !three:example.org", next)
 	}
 }

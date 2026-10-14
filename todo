@@ -165,34 +165,34 @@ A lightweight, non-Electron native desktop client for Matrix and Beeper, powered
 ## 📦 Phase 8: Multi-Platform Standalone Builds (No Installers)
 - [ ] **Go Toolchain & Binary Optimization:**
   - [ ] Embed static assets, default fonts, and application icons directly into the binary using `//go:embed`.
-  - [ ] Strip debug symbols to reduce binary size: `go build -ldflags="-s -w"`.
-  - [ ] Inject version metadata at build time: `-ldflags="-X main.Version=... -X main.Commit=..."`.
+  - [x] Strip debug symbols to reduce binary size: `go build -ldflags="-s -w"`.
+  - [x] Inject version metadata at build time: `-ldflags="-X main.Version=... -X main.Commit=..."`.
 - [ ] **Windows Executable (`.exe` standalone):**
-  - [ ] Suppress background command prompt window: `-ldflags="-H=windowsgui"`.
-  - [ ] Embed application icon (`.ico`) and manifest directly into the executable (using `rsrc` or `fyne package`).
+  - [x] Suppress background command prompt window: `-ldflags="-H=windowsgui"`.
+  - [x] Embed application icon (`.ico`) and manifest directly into the executable (using `rsrc` or `fyne package`).
   - [ ] Target architectures: `windows/amd64` and `windows/arm64`.
-  - [ ] Distribution output: Portable `.exe` inside a `.zip` archive (no MSI or InnoSetup).
+  - [x] Distribution output: Portable `.exe` inside a `.zip` archive (no MSI or InnoSetup).
 - [ ] **Linux Executable (ELF standalone):**
-  - [ ] Target architectures: `linux/amd64` and `linux/arm64`.
-  - [ ] Build inside an older glibc LTS container (e.g., Ubuntu 20.04 or Debian stable) to ensure compatibility across distributions.
-  - [ ] Distribution output: Single standalone binary inside a `.tar.gz` archive with a desktop icon file included.
+  - [x] Target architectures: `linux/amd64` and `linux/arm64`.
+  - [x] Build inside an older glibc LTS container (e.g., Ubuntu 20.04 or Debian stable) to ensure compatibility across distributions.
+  - [x] Distribution output: Single standalone binary inside a `.tar.gz` archive with a desktop icon file included.
 - [ ] **macOS Executable (`.app` bundle standalone):**
-  - [ ] Package as a standalone `.app` bundle directory structure (required by macOS for Retina assets, notification entitlements, and docks).
-  - [ ] Embed high-resolution multi-size icon file (`.icns`).
-  - [ ] Build **Universal Binary** supporting both Apple Silicon (`arm64`) and Intel (`x86_64`) using `lipo`:
+  - [x] Package as a standalone `.app` bundle directory structure (required by macOS for Retina assets, notification entitlements, and docks).
+  - [x] Embed high-resolution multi-size icon file (`.icns`).
+  - [x] Build **Universal Binary** supporting both Apple Silicon (`arm64`) and Intel (`x86_64`) using `lipo`:
     ```bash
     lipo -create -output AppName-universal AppName-darwin-amd64 AppName-darwin-arm64
     ```
-  - [ ] Apply ad-hoc signature to prevent immediate Gatekeeper launch crashes:
+  - [x] Apply ad-hoc signature to prevent immediate Gatekeeper launch crashes:
     ```bash
     codesign --force --deep -s - "AppName.app"
     ```
-  - [ ] Distribution output: Zipped `.app` bundle (`AppName-macos-universal.zip`, no `.dmg` or `.pkg`).
+  - [x] Distribution output: Zipped `.app` bundle (`AppName-macos-universal.zip`, no `.dmg` or `.pkg`).
 - [ ] **CI/CD Automation (GitHub Actions):**
-  - [ ] Create `.github/workflows/release.yml` with a multi-runner matrix (`windows-latest`, `ubuntu-latest`, `macos-latest`).
-  - [ ] Trigger automated builds on Git tags (e.g., `v0.1.0`).
-  - [ ] Generate SHA-256 integrity hash file (`checksums.txt`).
-  - [ ] Automatically publish a GitHub Release with standalone artifacts attached:
-    - `app-windows-amd64.zip`
-    - `app-linux-amd64.tar.gz`
-    - `app-macos-universal.zip`
+  - [x] Create `.github/workflows/release.yml` with a multi-runner matrix (`windows-latest`, `ubuntu-latest`, `macos-latest`).
+  - [x] Trigger automated builds on Git tags (e.g., `v0.1.0`).
+  - [x] Generate SHA-256 integrity hash file (`checksums.txt`).
+  - [x] Automatically publish a GitHub Release with standalone artifacts attached:
+    - [x] `app-windows-amd64.zip`
+    - [x] `app-linux-amd64.tar.gz`
+    - [x] `app-macos-universal.zip`

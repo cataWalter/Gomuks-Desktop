@@ -83,6 +83,20 @@ func TestChatViewRequestsOlderPageOnceAndRecoversAfterFailure(t *testing.T) {
 	}
 }
 
+func TestShouldGroupConsecutiveMessages(t *testing.T) {
+	start := time.Date(2026, time.October, 14, 17, 0, 0, 0, time.UTC)
+	first := matrix.Message{Sender: "@alice:example.org", Timestamp: start}
+	if !shouldGroupMessages(first, matrix.Message{Sender: first.Sender, Timestamp: start.Add(5 * time.Minute)}) {
+		t.Fatal("messages from the same sender at the five-minute boundary should group")
+	}
+	if shouldGroupMessages(first, matrix.Message{Sender: first.Sender, Timestamp: start.Add(5*time.Minute + time.Second)}) {
+		t.Fatal("messages more than five minutes apart should not group")
+	}
+	if shouldGroupMessages(first, matrix.Message{Sender: "@bob:example.org", Timestamp: start.Add(time.Minute)}) {
+		t.Fatal("messages from different senders should not group")
+	}
+}
+
 func TestChatViewExplainsMessageLoadingAndEmptyHistory(t *testing.T) {
 	view := NewChatView(nil)
 	view.SetRoom(matrix.Room{ID: "!room:example.org", Name: "Room"})
@@ -119,5 +133,22 @@ func TestComposerEnterSendsAndShiftEnterAddsNewline(t *testing.T) {
 	view.input.KeyUp(&fyne.KeyEvent{Name: desktop.KeyShiftRight})
 	if sent != "hello" || view.input.Text != "first\n" {
 		t.Fatalf("Shift+Enter result: sent %q, text %q", sent, view.input.Text)
+	}
+}
+
+func TestComposerCtrlEnterModeKeepsPlainEnterAsNewline(t *testing.T) {
+	var sent string
+	view := NewChatView(func(_, text string) { sent = text })
+	view.SetRoom(matrix.Room{ID: "!room:example.org"})
+	view.SetSendOnCtrlEnter(true)
+	view.input.SetText("first")
+	view.input.CursorRow = 0
+	view.input.CursorColumn = len([]rune(view.input.Text))
+	view.input.TypedKey(&fyne.KeyEvent{Name: fyne.KeyReturn})
+	if sent != "" || view.input.Text != "first\n" {
+		t.Fatalf("plain Enter in Ctrl+Enter mode: sent %q, text %q", sent, view.input.Text)
+	}
+	if view.input.PlaceHolder != "Write a message... (Ctrl+Enter to send, Enter for a new line)" {
+		t.Fatalf("Ctrl+Enter placeholder = %q", view.input.PlaceHolder)
 	}
 }

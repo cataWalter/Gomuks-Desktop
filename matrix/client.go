@@ -38,21 +38,21 @@ const timelinePageSize = 100
 
 // Room and Message are UI-facing snapshots that do not expose gomuks internals.
 type Room struct {
-	ID       string
-	Name     string
-	Topic    string
-	Avatar   string
-	Preview  string
-	LastSeen time.Time
-	Direct   bool
-	Favorite bool
-	Muted    bool
-	Unread   int
-	Mentions int
-	Unanswered bool
-	LastEventID string
+	ID              string
+	Name            string
+	Topic           string
+	Avatar          string
+	Preview         string
+	LastSeen        time.Time
+	Direct          bool
+	Favorite        bool
+	Muted           bool
+	Unread          int
+	Mentions        int
+	Unanswered      bool
+	LastEventID     string
 	LastEventSender string
-	LastEventAt time.Time
+	LastEventAt     time.Time
 }
 
 type Message struct {
@@ -79,11 +79,29 @@ type Member struct {
 	DisplayName string
 }
 
+type AccountProfile struct {
+	UserID      string
+	DisplayName string
+	Homeserver  string
+	DeviceID    string
+	AvatarURI   string
+	Verified    bool
+}
+
 type HistoryPage struct {
 	Messages []Message
 	Before   int64
 	HasMore  bool
 }
+
+type ConnectionState string
+
+const (
+	StateConnecting ConnectionState = "connecting"
+	StateSyncing    ConnectionState = "syncing"
+	StateConnected  ConnectionState = "connected"
+	StateOffline    ConnectionState = "offline"
+)
 
 // Update is emitted when gomuks has persisted sync data to its local database.
 type Update struct {
@@ -94,6 +112,7 @@ type Update struct {
 	Notifications         []Notification
 	Error                 string
 	InitialSyncComplete   bool
+	ConnectionState       ConnectionState
 }
 
 type Notification struct {
@@ -119,6 +138,7 @@ type Client struct {
 	pendingTimelineRooms map[string]struct{}
 	dismissedEvents      map[string]string
 	syncReady            bool
+	connectionState      ConnectionState
 
 	closeOnce       sync.Once
 	eventMu         sync.Mutex
@@ -179,7 +199,7 @@ func New(databasePath string) (*Client, error) {
 		client.Close()
 		return nil, fmt.Errorf("initialize gomuks database: %w", err)
 	}
-	if err = client.engine.DB.Exec(ctx, `CREATE TABLE IF NOT EXISTS room_unanswered_status (
+	if _, err = client.engine.DB.Exec(ctx, `CREATE TABLE IF NOT EXISTS room_unanswered_status (
 		room_id TEXT PRIMARY KEY,
 		dismissed_event_id TEXT NOT NULL,
 		dismissed_at INTEGER NOT NULL
@@ -240,7 +260,7 @@ func (c *Client) SetRoomUnanswered(ctx context.Context, roomID string, unanswere
 	}
 
 	if unanswered {
-		if err = c.engine.DB.Exec(ctx, `DELETE FROM room_unanswered_status WHERE room_id = ?`, roomID); err != nil {
+		if _, err = c.engine.DB.Exec(ctx, `DELETE FROM room_unanswered_status WHERE room_id = ?`, roomID); err != nil {
 			return fmt.Errorf("restore unanswered chat state: %w", err)
 		}
 		c.mu.Lock()
@@ -255,7 +275,7 @@ func (c *Client) SetRoomUnanswered(ctx context.Context, roomID string, unanswere
 		if eventID == "" {
 			eventID = room.ID
 		}
-		if err = c.engine.DB.Exec(ctx, `INSERT INTO room_unanswered_status (room_id, dismissed_event_id, dismissed_at)
+		if _, err = c.engine.DB.Exec(ctx, `INSERT INTO room_unanswered_status (room_id, dismissed_event_id, dismissed_at)
 			VALUES (?, ?, ?) ON CONFLICT(room_id) DO UPDATE SET
 			dismissed_event_id = excluded.dismissed_event_id, dismissed_at = excluded.dismissed_at`,
 			roomID, eventID, time.Now().UnixMilli()); err != nil {
@@ -264,7 +284,7 @@ func (c *Client) SetRoomUnanswered(ctx context.Context, roomID string, unanswere
 		c.mu.Lock()
 		c.dismissedEvents[roomID] = eventID
 		if current, ok := c.rooms[roomID]; ok {
-			current.Unanswered = false
+			current.Unanswered = roomNeedsReply(current, c.currentUserID(), eventID)
 			c.rooms[roomID] = current
 		}
 		c.mu.Unlock()
@@ -326,10 +346,56 @@ func (c *Client) NeedsVerification() bool {
 	return c.engine.IsLoggedIn() && !c.engine.VerificationState.IsVerified
 }
 
+func (c *Client) Profile() AccountProfile {
+	profile := AccountProfile{Verified: !c.NeedsVerification()}
+	if account := c.engine.Account; account != nil {
+		profile.UserID = string(account.UserID)
+		profile.DisplayName = account.DisplayName
+		profile.Homeserver = account.HomeserverURL
+		profile.DeviceID = string(account.DeviceID)
+		profile.AvatarURI = account.AvatarURL.String()
+	}
+	return profile
+}
+
+func (c *Client) StorageUsage() (databaseBytes, walBytes int64, err error) {
+	databaseInfo, err := os.Stat(c.dbPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat Matrix database: %w", err)
+	}
+	databaseBytes = databaseInfo.Size()
+	walInfo, err := os.Stat(c.dbPath + "-wal")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return 0, 0, fmt.Errorf("stat Matrix database WAL: %w", err)
+	}
+	if err == nil {
+		walBytes = walInfo.Size()
+	}
+	return databaseBytes, walBytes, nil
+}
+
+func (c *Client) OptimizeDatabase(ctx context.Context) error {
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if _, err = c.engine.DB.Exec(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("optimize Matrix database: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) SyncReady() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.syncReady
+}
+
+func (c *Client) ConnectionState() ConnectionState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connectionState
 }
 
 func (c *Client) Rooms() []Room {
@@ -452,11 +518,18 @@ func (c *Client) startEngine(ctx context.Context) error {
 	if c.started {
 		return nil
 	}
+	c.mu.Lock()
+	c.connectionState = StateConnecting
+	c.mu.Unlock()
 	// Start initializes the gomuks client and launches its Matrix sync loop.
 	if err := c.engine.Start(ctx); err != nil {
+		c.mu.Lock()
+		c.connectionState = StateOffline
+		c.mu.Unlock()
 		return err
 	}
 	c.started = true
+	c.publish(nil, "")
 	return nil
 }
 
@@ -837,6 +910,40 @@ func (c *Client) DownloadAvatar(ctx context.Context, mxc string) ([]byte, error)
 	return data, nil
 }
 
+func (c *Client) DownloadMedia(ctx context.Context, mxc string, encrypted *event.EncryptedFileInfo) ([]byte, error) {
+	if strings.TrimSpace(mxc) == "" {
+		return nil, errors.New("Matrix media URI is empty")
+	}
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer finish()
+	uri, err := id.ContentURIString(mxc).Parse()
+	if err != nil {
+		return nil, fmt.Errorf("parse Matrix media URI: %w", err)
+	}
+	response, err := c.engine.Client.Download(ctx, uri)
+	if err != nil {
+		return nil, fmt.Errorf("download Matrix media: %w", err)
+	}
+	defer response.Body.Close()
+	const maxMediaBytes = 50 << 20
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxMediaBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Matrix media: %w", err)
+	}
+	if len(data) > maxMediaBytes {
+		return nil, fmt.Errorf("Matrix media exceeds %d MiB", maxMediaBytes>>20)
+	}
+	if encrypted != nil {
+		if err = encrypted.DecryptInPlace(data); err != nil {
+			return nil, fmt.Errorf("decrypt Matrix media: %w", err)
+		}
+	}
+	return data, nil
+}
+
 func (c *Client) Close() {
 	c.closeOnce.Do(func() {
 		c.lifecycleMu.Lock()
@@ -910,17 +1017,30 @@ func (c *Client) handleBackendEvent(raw any) {
 		}
 	case *jsoncmd.SyncStatus:
 		message := ""
-		if evt.Type == jsoncmd.SyncStatusErroring || evt.Type == jsoncmd.SyncStatusFailed {
+		c.mu.Lock()
+		switch evt.Type {
+		case jsoncmd.SyncStatusErroring, jsoncmd.SyncStatusFailed:
+			c.connectionState = StateOffline
 			message = evt.Error
-		} else if evt.Type == jsoncmd.SyncStatusOK {
-			c.mu.Lock()
+			if message == "" {
+				message = "Matrix sync is offline"
+			}
+		case jsoncmd.SyncStatusOK:
 			c.syncReady = true
-			c.mu.Unlock()
+			c.connectionState = StateConnected
+		case jsoncmd.SyncStatusWaiting:
+			if c.syncReady {
+				c.connectionState = StateConnected
+			} else {
+				c.connectionState = StateSyncing
+			}
 		}
+		c.mu.Unlock()
 		c.publish(nil, message)
 	case *jsoncmd.InitComplete:
 		c.mu.Lock()
 		c.syncReady = true
+		c.connectionState = StateConnected
 		c.mu.Unlock()
 		c.publish(nil, "")
 	}
@@ -1091,6 +1211,10 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 	if err := json.Unmarshal(evt.GetContent(), &content); err != nil || content.Body == "" {
 		return Message{}, false
 	}
+	mediaURI := content.URL
+	if mediaURI == "" && content.File != nil {
+		mediaURI = string(content.File.URL)
+	}
 	return Message{
 		ID:             evt.ID.String(),
 		TransactionID:  evt.TransactionID,
@@ -1102,7 +1226,7 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		Sending:        evt.SendError == "not sent",
 		SendError:      evt.SendError,
 		Reactions:      evt.Reactions,
-		MediaURI:       content.URL,
+		MediaURI:       mediaURI,
 		MediaEncrypted: content.File,
 		MediaMIME:      mediaMIME(content.Info),
 	}, true
@@ -1133,9 +1257,9 @@ func (c *Client) storeLocalMessage(roomID string, message Message) {
 		}
 		if !message.Timestamp.Before(room.LastEventAt) {
 			room.LastEventAt = message.Timestamp
-		room.LastEventID = message.ID
-		room.LastEventSender = message.Sender
-		room.Unanswered = roomNeedsReply(room, c.currentUserID(), c.dismissedEvents[roomID])
+			room.LastEventID = message.ID
+			room.LastEventSender = message.Sender
+			room.Unanswered = roomNeedsReply(room, c.currentUserID(), c.dismissedEvents[roomID])
 		}
 		c.rooms[roomID] = room
 	}
@@ -1143,7 +1267,8 @@ func (c *Client) storeLocalMessage(roomID string, message Message) {
 }
 
 func roomNeedsReply(room Room, userID, dismissedEventID string) bool {
-	if dismissedEventID != "" && room.LastEventID == dismissedEventID {
+	if dismissedEventID != "" &&
+		(room.LastEventID == dismissedEventID || (room.LastEventID == "" && dismissedEventID == room.ID)) {
 		return false
 	}
 	return room.Unread > 0 || (room.LastEventSender != "" && room.LastEventSender != userID)
@@ -1153,7 +1278,7 @@ func (c *Client) currentUserID() string {
 	if c.engine == nil || c.engine.Account == nil {
 		return ""
 	}
-	return c.engine.Account.UserID
+	return string(c.engine.Account.UserID)
 }
 
 func (c *Client) removeLocalMessage(roomID string, evt *database.Event) {
@@ -1188,6 +1313,7 @@ func (c *Client) publish(changed []string, errMessage string) {
 		ChangedRoomID:       append([]string(nil), changed...),
 		Error:               errMessage,
 		InitialSyncComplete: c.SyncReady(),
+		ConnectionState:     c.ConnectionState(),
 	}
 	c.mu.Lock()
 	if c.pendingTimelineRooms == nil {

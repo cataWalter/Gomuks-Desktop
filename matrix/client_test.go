@@ -40,6 +40,48 @@ func TestMessageFromEvent(t *testing.T) {
 	}
 }
 
+func TestMessageFromEventMapsMediaMetadata(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		wantURI   string
+		encrypted bool
+	}{
+		{
+			name:    "unencrypted",
+			content: `{"body":"photo","url":"mxc://example.org/plain","info":{"mimetype":"image/png"}}`,
+			wantURI: "mxc://example.org/plain",
+		},
+		{
+			name:      "encrypted",
+			content:   `{"body":"photo","file":{"url":"mxc://example.org/encrypted","key":{},"iv":"iv","hashes":{},"v":"v2"}}`,
+			wantURI:   "mxc://example.org/encrypted",
+			encrypted: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evt := &database.Event{
+				Type:    event.EventMessage.Type,
+				Content: json.RawMessage(test.content),
+			}
+			message, ok := messageFromEvent(evt)
+			if !ok {
+				t.Fatal("expected a media message")
+			}
+			if message.MediaURI != test.wantURI {
+				t.Errorf("media URI = %q, want %q", message.MediaURI, test.wantURI)
+			}
+			if (message.MediaEncrypted != nil) != test.encrypted {
+				t.Errorf("encrypted metadata present = %t, want %t", message.MediaEncrypted != nil, test.encrypted)
+			}
+			if !test.encrypted && message.MediaMIME != "image/png" {
+				t.Errorf("media MIME = %q, want image/png", message.MediaMIME)
+			}
+		})
+	}
+}
+
 func TestMessageFromEventIgnoresNonMessages(t *testing.T) {
 	tests := []struct {
 		name string
@@ -87,6 +129,10 @@ func TestRoomNeedsReplyHonorsUnreadIncomingAndDismissedEvents(t *testing.T) {
 	if !roomNeedsReply(room, "@me:example.org", "") {
 		t.Fatal("unread messages should put the room in needs-reply")
 	}
+	room = Room{ID: "!cached:example.org", Unread: 2}
+	if roomNeedsReply(room, "@me:example.org", room.ID) {
+		t.Fatal("a dismissed room with no locally known latest event should stay dismissed")
+	}
 }
 
 func TestPublishCoalescesTimelineChangedRoomIDs(t *testing.T) {
@@ -107,6 +153,25 @@ func TestPublishCoalescesTimelineChangedRoomIDs(t *testing.T) {
 	}
 	if len(update.ChangedRoomID) != 0 {
 		t.Fatalf("metadata changed rooms = %v, want none", update.ChangedRoomID)
+	}
+}
+
+func TestSyncStatusPublishesConnectionStates(t *testing.T) {
+	client := &Client{
+		events: make(chan Update, 4),
+		done:   make(chan struct{}),
+	}
+	client.handleBackendEvent(&jsoncmd.SyncStatus{Type: jsoncmd.SyncStatusWaiting})
+	if got := (<-client.events).ConnectionState; got != StateSyncing {
+		t.Fatalf("waiting state = %q, want %q", got, StateSyncing)
+	}
+	client.handleBackendEvent(&jsoncmd.SyncStatus{Type: jsoncmd.SyncStatusOK})
+	if update := <-client.events; update.ConnectionState != StateConnected || !update.InitialSyncComplete {
+		t.Fatalf("connected update = %+v", update)
+	}
+	client.handleBackendEvent(&jsoncmd.SyncStatus{Type: jsoncmd.SyncStatusFailed})
+	if update := <-client.events; update.ConnectionState != StateOffline || update.Error == "" {
+		t.Fatalf("offline update = %+v", update)
 	}
 }
 
