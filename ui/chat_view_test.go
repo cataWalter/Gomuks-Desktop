@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/driver/desktop"
 	"mychat/matrix"
 )
 
@@ -96,5 +98,26 @@ func TestChatViewExplainsMessageLoadingAndEmptyHistory(t *testing.T) {
 	view.SetMessages([]matrix.Message{{ID: "$message", Body: "hello"}})
 	if view.empty.Visible() {
 		t.Fatal("empty-state label should be hidden when messages are available")
+	}
+}
+
+func TestComposerEnterSendsAndShiftEnterAddsNewline(t *testing.T) {
+	var sent string
+	view := NewChatView(func(_, text string) { sent = text })
+	view.SetRoom(matrix.Room{ID: "!room:example.org"})
+	view.input.SetText("hello")
+	view.input.TypedKey(&fyne.KeyEvent{Name: fyne.KeyReturn})
+	if sent != "hello" || view.input.Text != "" {
+		t.Fatalf("Enter result: sent %q, remaining text %q", sent, view.input.Text)
+	}
+
+	view.input.SetText("first")
+	view.input.CursorRow = 0
+	view.input.CursorColumn = len([]rune(view.input.Text))
+	view.input.KeyDown(&fyne.KeyEvent{Name: desktop.KeyShiftRight})
+	view.input.TypedKey(&fyne.KeyEvent{Name: fyne.KeyReturn})
+	view.input.KeyUp(&fyne.KeyEvent{Name: desktop.KeyShiftRight})
+	if sent != "hello" || view.input.Text != "first\n" {
+		t.Fatalf("Shift+Enter result: sent %q, text %q", sent, view.input.Text)
 	}
 }

@@ -7,6 +7,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/gomuks v0.2609.0
 	go.mau.fi/util v0.10.1
+	golang.org/x/image v0.46.0
 	maunium.net/go/mautrix v0.31.0
 )
 
@@ -14,6 +15,7 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	fyne.io/systray v1.12.3-0.20260810170012-af4e8e793ec4 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
+	github.com/FyshOS/fancyfs v0.0.1 // indirect
 	github.com/alecthomas/chroma/v2 v2.27.0 // indirect
 	github.com/anthonynsimon/bild v0.14.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
@@ -53,7 +55,6 @@ require (
 	github.com/yuin/goldmark v1.8.6 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/image v0.46.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

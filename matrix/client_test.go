@@ -21,7 +21,7 @@ func TestMessageFromEvent(t *testing.T) {
 		ID:        id.EventID("$message"),
 		Sender:    id.UserID("@alice:example.org"),
 		Type:      event.EventMessage.Type,
-		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hello"}`),
+		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hello","formatted_body":"<strong>hello</strong>"}`),
 		Timestamp: jsontime.UM(timestamp),
 	}
 
@@ -34,6 +34,9 @@ func TestMessageFromEvent(t *testing.T) {
 	}
 	if !message.Timestamp.Equal(timestamp) {
 		t.Fatalf("timestamp = %s, want %s", message.Timestamp, timestamp)
+	}
+	if message.FormattedBody != "<strong>hello</strong>" {
+		t.Fatalf("formatted body = %q", message.FormattedBody)
 	}
 }
 
@@ -64,6 +67,49 @@ func TestMessageFromEventIgnoresNonMessages(t *testing.T) {
 	}
 }
 
+func TestRoomNeedsReplyHonorsUnreadIncomingAndDismissedEvents(t *testing.T) {
+	room := Room{LastEventID: "$incoming", LastEventSender: "@alice:example.org"}
+	if !roomNeedsReply(room, "@me:example.org", "") {
+		t.Fatal("incoming event should need a reply")
+	}
+	if roomNeedsReply(room, "@me:example.org", "$incoming") {
+		t.Fatal("dismissed event should not need a reply")
+	}
+	room.LastEventID = "$next"
+	if !roomNeedsReply(room, "@me:example.org", "$incoming") {
+		t.Fatal("a new incoming event should reactivate the room")
+	}
+	room.LastEventSender = "@me:example.org"
+	if roomNeedsReply(room, "@me:example.org", "") {
+		t.Fatal("outgoing event with no unread messages should not need a reply")
+	}
+	room.Unread = 1
+	if !roomNeedsReply(room, "@me:example.org", "") {
+		t.Fatal("unread messages should put the room in needs-reply")
+	}
+}
+
+func TestPublishCoalescesTimelineChangedRoomIDs(t *testing.T) {
+	client := &Client{
+		events: make(chan Update, 1),
+		done:   make(chan struct{}),
+	}
+	client.publishTimeline([]string{"!first:example.org"}, "")
+	client.publishTimeline([]string{"!second:example.org"}, "")
+
+	update := <-client.events
+	if len(update.TimelineChangedRoomID) != 2 {
+		t.Fatalf("timeline changed rooms = %v, want both coalesced room IDs", update.TimelineChangedRoomID)
+	}
+	if update.TimelineChangedRoomID[0] != "!first:example.org" ||
+		update.TimelineChangedRoomID[1] != "!second:example.org" {
+		t.Fatalf("timeline changed rooms = %v, want sorted room IDs", update.TimelineChangedRoomID)
+	}
+	if len(update.ChangedRoomID) != 0 {
+		t.Fatalf("metadata changed rooms = %v, want none", update.ChangedRoomID)
+	}
+}
+
 func TestApplySyncUpdatesRoomsAndRemovesLeftRooms(t *testing.T) {
 	client := &Client{
 		events: make(chan Update, 1),
@@ -74,11 +120,20 @@ func TestApplySyncUpdatesRoomsAndRemovesLeftRooms(t *testing.T) {
 	}
 	name := "Project chat"
 	topic := "Planning"
+	dmUser := id.UserID("@alice:example.org")
+	avatar := id.ContentURIString("mxc://example.org/room-avatar").ParseOrIgnore()
 	roomID := id.RoomID("!project:example.org")
 	room := &database.Room{
-		ID:    roomID,
-		Name:  &name,
-		Topic: &topic,
+		ID:       roomID,
+		Name:     &name,
+		Topic:    &topic,
+		Avatar:   &avatar,
+		DMUserID: &dmUser,
+		UnreadCounts: database.UnreadCounts{
+			UnreadMessages:      5,
+			UnreadNotifications: 2,
+			UnreadHighlights:    1,
+		},
 	}
 	latest := time.Date(2026, time.October, 14, 17, 5, 0, 0, time.UTC)
 	syncEvent := &jsoncmd.SyncComplete{
@@ -104,8 +159,11 @@ func TestApplySyncUpdatesRoomsAndRemovesLeftRooms(t *testing.T) {
 		t.Fatalf("room count = %d, want 1", len(rooms))
 	}
 	got := rooms[0]
-	if got.ID != roomID.String() || got.Name != name || got.Topic != topic || got.Preview != "latest" {
+	if got.ID != roomID.String() || got.Name != name || got.Topic != topic || got.Avatar != avatar.String() || got.Preview != "latest" {
 		t.Fatalf("unexpected room snapshot: %+v", got)
+	}
+	if !got.Direct || got.Unread != 7 || got.Mentions != 1 {
+		t.Fatalf("room direct/unread metadata was not mapped: %+v", got)
 	}
 	if !got.LastSeen.Equal(latest) {
 		t.Fatalf("last seen = %s, want %s", got.LastSeen, latest)

@@ -21,8 +21,23 @@ Run with:
 go run -tags "sqlite_fts5 goolm" .
 ```
 
+In a Linux VNC desktop, make sure its X server is running and launch the app
+with that display selected. This workspace's VNC setup uses display `:1`:
+
+```sh
+export DISPLAY=:1
+go run -tags "sqlite_fts5 goolm" .
+```
+
+If both `DISPLAY` and `WAYLAND_DISPLAY` are unset, the app exits with a
+diagnostic instead of attempting to initialize Fyne's desktop driver.
+
 Sync events are handled off the GUI thread and all resulting widget updates are
 scheduled with `fyne.Do`.
+
+Room and member profile images are downloaded from their Matrix content URIs,
+cached in memory for the current app session, and resized for display. Missing
+or unavailable images use a generated initials icon instead.
 
 To compile and run tests without a native desktop display driver:
 

@@ -4,12 +4,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"mychat/matrix"
 	"mychat/ui"
 )
 
 func main() {
+	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		log.Print("no graphical display found; in the VNC desktop run `export DISPLAY=:1` before starting Matrix")
+		return
+	}
+
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		log.Fatal(err)

@@ -1,0 +1,12 @@
+{
+  "name": "Beeper Environment",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "forwardPorts": [6080],
+  "portsAttributes": {
+    "6080": {
+      "label": "Beeper GUI",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postAttachCommand": "bash start-beeper.sh"
+}
