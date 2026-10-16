@@ -1,13 +1,14 @@
 package main
 
 import (
+	"embed"
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 
+	"mychat/desktop"
 	"mychat/matrix"
-	"mychat/ui"
+	"mychat/migration"
 )
 
 var (
@@ -16,26 +17,26 @@ var (
 	BuildDate = "unknown"
 )
 
-func main() {
-	if runtime.GOOS == "linux" && os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
-		log.Print("no graphical display found; in the VNC desktop run `export DISPLAY=:1` before starting Matrix")
-		return
-	}
+//go:embed all:frontend/dist
+var frontendAssets embed.FS
 
-	configDir, err := os.UserConfigDir()
+func main() {
+	paths, err := migration.CurrentPaths()
 	if err != nil {
 		log.Fatal(err)
 	}
-	dataDir := filepath.Join(configDir, "gomuks-desktop")
-	legacyDir := filepath.Join(configDir, "fyne-matrix")
-	if _, err = os.Stat(dataDir); err != nil && legacyDir != dataDir {
-		if _, legacyErr := os.Stat(legacyDir); legacyErr == nil {
-			log.Printf("using existing Matrix data directory at %s", legacyDir)
-			dataDir = legacyDir
-		}
+	migrationReport, err := migration.MigrateLegacy(paths)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if migrationReport.DatabaseMigrated {
+		log.Printf("migrated Matrix data into %s", paths.DataDir)
+	}
+	if migrationReport.PreferencesWarning != nil {
+		log.Printf("could not migrate legacy preferences: %v", migrationReport.PreferencesWarning)
 	}
 
-	client, err := matrix.New(filepath.Join(dataDir, "matrix.db"))
+	client, err := matrix.New(filepath.Join(paths.DataDir, "matrix.db"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -43,5 +44,7 @@ func main() {
 		client.SetMediaCacheDir(filepath.Join(cacheDir, "gomuks-desktop", "media"))
 	}
 
-	ui.NewApp(client).Run()
+	if err = desktop.Run(client, frontendAssets, paths.PreferencesFile); err != nil {
+		log.Fatal(err)
+	}
 }

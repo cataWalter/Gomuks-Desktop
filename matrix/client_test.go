@@ -1,6 +1,7 @@
 package matrix
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -43,21 +44,61 @@ func TestMessageFromEvent(t *testing.T) {
 
 func TestMessageFromEventMapsMediaMetadata(t *testing.T) {
 	tests := []struct {
-		name      string
-		content   string
-		wantURI   string
-		encrypted bool
+		name       string
+		content    string
+		wantURI    string
+		wantMIME   string
+		wantBody   string
+		wantWidth  int
+		wantHeight int
+		encrypted  bool
 	}{
 		{
-			name:    "unencrypted",
-			content: `{"body":"photo","url":"mxc://example.org/plain","info":{"mimetype":"image/png","w":640,"h":480}}`,
-			wantURI: "mxc://example.org/plain",
+			name:       "unencrypted",
+			content:    `{"body":"photo","url":"mxc://example.org/plain","info":{"mimetype":"image/png","w":640,"h":480}}`,
+			wantURI:    "mxc://example.org/plain",
+			wantMIME:   "image/png",
+			wantBody:   "photo",
+			wantWidth:  640,
+			wantHeight: 480,
 		},
 		{
 			name:      "encrypted",
 			content:   `{"body":"photo","file":{"url":"mxc://example.org/encrypted","key":{},"iv":"iv","hashes":{},"v":"v2"}}`,
 			wantURI:   "mxc://example.org/encrypted",
 			encrypted: true,
+		},
+		{
+			name:      "encrypted image without info",
+			content:   `{"msgtype":"m.image","body":"photo.png","file":{"url":"mxc://example.org/image-without-info","key":{},"iv":"iv","hashes":{},"v":"v2"}}`,
+			wantURI:   "mxc://example.org/image-without-info",
+			wantMIME:  "image/unknown",
+			encrypted: true,
+		},
+		{
+			name: "Beeper gallery image and video",
+			content: `{"msgtype":"com.beeper.gallery","body":"Sent an album with 1 image and 1 video:","com.beeper.gallery.images":[` +
+				`{"msgtype":"m.image","body":"photo.jpg","file":{"url":"mxc://example.org/gallery-image","key":{},"iv":"iv","hashes":{},"v":"v2"},"info":{"mimetype":"image/jpeg","w":640,"h":480}},` +
+				`{"msgtype":"m.video","body":"clip.mp4","file":{"url":"mxc://example.org/gallery-video","key":{},"iv":"iv","hashes":{},"v":"v2"}}]}`,
+			wantURI:    "mxc://example.org/gallery-image",
+			wantMIME:   "image/jpeg",
+			wantBody:   "Sent an album with 1 image and 1 video:",
+			wantWidth:  640,
+			wantHeight: 480,
+			encrypted:  true,
+		},
+		{
+			name:      "encrypted image without legacy body",
+			content:   `{"msgtype":"m.image","file":{"url":"mxc://example.org/bodyless-image","key":{},"iv":"iv","hashes":{},"v":"v2"},"info":{"mimetype":"image/jpeg"}}`,
+			wantURI:   "mxc://example.org/bodyless-image",
+			wantMIME:  "image/jpeg",
+			wantBody:  "Image",
+			encrypted: true,
+		},
+		{
+			name:     "extensible text without legacy body",
+			content:  `{"m.text":[{"body":"hello from extensible text"}]}`,
+			wantBody: "hello from extensible text",
 		},
 	}
 	for _, test := range tests {
@@ -76,11 +117,14 @@ func TestMessageFromEventMapsMediaMetadata(t *testing.T) {
 			if (message.MediaEncrypted != nil) != test.encrypted {
 				t.Errorf("encrypted metadata present = %t, want %t", message.MediaEncrypted != nil, test.encrypted)
 			}
-			if !test.encrypted && message.MediaMIME != "image/png" {
-				t.Errorf("media MIME = %q, want image/png", message.MediaMIME)
+			if message.MediaMIME != test.wantMIME {
+				t.Errorf("media MIME = %q, want %q", message.MediaMIME, test.wantMIME)
 			}
-			if !test.encrypted && (message.MediaWidth != 640 || message.MediaHeight != 480) {
-				t.Errorf("media dimensions = %dx%d, want 640x480", message.MediaWidth, message.MediaHeight)
+			if test.wantBody != "" && message.Body != test.wantBody {
+				t.Errorf("message body = %q, want %q", message.Body, test.wantBody)
+			}
+			if message.MediaWidth != test.wantWidth || message.MediaHeight != test.wantHeight {
+				t.Errorf("media dimensions = %dx%d, want %dx%d", message.MediaWidth, message.MediaHeight, test.wantWidth, test.wantHeight)
 			}
 		})
 	}
@@ -387,6 +431,32 @@ func TestNewInitializesAndReopensLocalDatabase(t *testing.T) {
 	client.Close()
 }
 
+func TestWaitForCacheWaitsUntilRestoreCompletes(t *testing.T) {
+	client := &Client{cacheReady: make(chan struct{})}
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		result <- client.WaitForCache(context.Background())
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("WaitForCache returned before restore completed: %v", err)
+	default:
+	}
+
+	close(client.cacheReady)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("WaitForCache: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForCache did not return after restore completed")
+	}
+}
+
 func TestReconnectDelayDoublesAndCaps(t *testing.T) {
 	got := []time.Duration{
 		LastReconnectDelay(0),
@@ -442,6 +512,44 @@ func TestMediaCacheUsageAndClear(t *testing.T) {
 	}
 }
 
+func TestCachedMediaBytesUsesIncomingEncryptionMetadata(t *testing.T) {
+	uri := "mxc://example.org/encrypted-image"
+	client := &Client{mediaCacheDir: t.TempDir()}
+	client.rememberMediaEncryption([]Message{{
+		MediaURI:       uri,
+		MediaEncrypted: &event.EncryptedFileInfo{},
+	}})
+
+	plainPath, err := client.mediaCachePathFor(uri, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedPath, err := client.mediaCachePathFor(uri, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plainPath == encryptedPath {
+		t.Fatal("encrypted and plaintext media must use distinct cache paths")
+	}
+	if err := os.MkdirAll(filepath.Dir(encryptedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plainPath, []byte("ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(encryptedPath, []byte("decrypted image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.CachedMediaBytes(context.Background(), uri)
+	if err != nil || string(got) != "decrypted image" {
+		t.Fatalf("cached media = %q, %v; want decrypted image", got, err)
+	}
+	if path, ok := client.CachedMediaPath(uri); !ok || path != encryptedPath {
+		t.Fatalf("cached media path = %q, %v; want %q", path, ok, encryptedPath)
+	}
+}
+
 func TestBridgeLabelDetectsNetworks(t *testing.T) {
 	name := "WhatsApp Bridge"
 	client := &Client{}
@@ -470,4 +578,57 @@ func roomForBridgeTest(name *string, dmUser string) *database.Room {
 
 func stringPointer(value string) *string {
 	return &value
+}
+
+func TestMessageFromEventTreatsNotSentAsPendingNotError(t *testing.T) {
+	evt := &database.Event{
+		ID:        id.EventID("~hicli-1"),
+		Sender:    id.UserID("@me:example.org"),
+		Type:      event.EventMessage.Type,
+		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hi"}`),
+		SendError: "not sent",
+	}
+	message, ok := messageFromEvent(evt)
+	if !ok {
+		t.Fatal("expected pending message to be represented")
+	}
+	if !message.Sending {
+		t.Fatalf("Sending = false, want true: %+v", message)
+	}
+	if message.SendError != "" {
+		t.Fatalf("SendError = %q, want empty (pending marker is not a failure)", message.SendError)
+	}
+	if message.Edited {
+		t.Fatalf("fresh send flagged as edited: %+v", message)
+	}
+}
+
+func TestMessageFromEventKeepsRealSendErrors(t *testing.T) {
+	evt := &database.Event{
+		ID:        id.EventID("~hicli-2"),
+		Sender:    id.UserID("@me:example.org"),
+		Type:      event.EventMessage.Type,
+		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hi"}`),
+		SendError: "failed to encrypt: boom",
+	}
+	message, ok := messageFromEvent(evt)
+	if !ok {
+		t.Fatal("expected failed message to be represented")
+	}
+	if message.SendError != "failed to encrypt: boom" {
+		t.Fatalf("SendError = %q, want the real failure", message.SendError)
+	}
+}
+
+func TestShadowedByServerRowCoversRenamedOptimisticEntry(t *testing.T) {
+	sentAt := time.Now()
+	server := []Message{{ID: "$real", Sender: "@me:example.org", Body: "hi", Timestamp: sentAt}}
+	pending := Message{ID: "~hicli-1", Sender: "@me:example.org", Body: "hi", Sending: true, Timestamp: sentAt}
+	if !shadowedByServerRow(server, pending) {
+		t.Fatal("expected server-confirmed row to shadow the stale pending entry")
+	}
+	other := Message{ID: "~hicli-9", Sender: "@me:example.org", Body: "different", Sending: true, Timestamp: sentAt}
+	if shadowedByServerRow(server, other) {
+		t.Fatal("different body must not be shadowed")
+	}
 }

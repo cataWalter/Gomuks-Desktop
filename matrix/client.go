@@ -158,6 +158,7 @@ type Update struct {
 	Notifications         []Notification
 	Error                 string
 	InitialSyncComplete   bool
+	NeedsVerification     bool
 	ConnectionState       ConnectionState
 }
 
@@ -170,14 +171,16 @@ type Notification struct {
 }
 
 type Client struct {
-	engine *hicli.HiClient
-	dbPath string
-	events chan Update
-	done   chan struct{}
+	engine     *hicli.HiClient
+	dbPath     string
+	events     chan Update
+	done       chan struct{}
+	cacheReady chan struct{}
 
 	mu                   sync.RWMutex
 	rooms                map[string]Room
 	local                map[string]map[string]Message
+	mediaEncrypted       map[string]*event.EncryptedFileInfo
 	typing               map[string][]string
 	pendingNotifications []Notification
 	notifiedEvents       map[string]struct{}
@@ -200,8 +203,8 @@ type Client struct {
 	closed          bool
 }
 
-// New opens gomuks' SQLite stores, restores the cached account if present, and
-// loads cached room metadata. Network syncing is started separately by Start.
+// New opens gomuks' SQLite stores and restores the cached account if present.
+// Cached room metadata is loaded asynchronously; network syncing is started by Start.
 func New(databasePath string) (*Client, error) {
 	databasePath, err := filepath.Abs(databasePath)
 	if err != nil {
@@ -237,8 +240,10 @@ func New(databasePath string) (*Client, error) {
 		dbPath:               databasePath,
 		events:               make(chan Update, eventBufferSize),
 		done:                 make(chan struct{}),
+		cacheReady:           make(chan struct{}),
 		rooms:                make(map[string]Room),
 		local:                make(map[string]map[string]Message),
+		mediaEncrypted:       make(map[string]*event.EncryptedFileInfo),
 		typing:               make(map[string][]string),
 		notifiedEvents:       make(map[string]struct{}),
 		pendingTimelineRooms: make(map[string]struct{}),
@@ -298,9 +303,25 @@ func New(databasePath string) (*Client, error) {
 			client.Close()
 			return nil, fmt.Errorf("restore cached Matrix account: %w", err)
 		}
-		for initialSync := range client.engine.GetInitialSync(ctx, 100, 0) {
-			client.applySync(initialSync, false)
+		restoreCtx, finishRestore, restoreErr := client.beginOperation(ctx)
+		if restoreErr != nil {
+			client.Close()
+			return nil, fmt.Errorf("start cached Matrix restore: %w", restoreErr)
 		}
+		go func() {
+			defer func() {
+				close(client.cacheReady)
+				finishRestore()
+			}()
+			for initialSync := range client.engine.GetInitialSync(restoreCtx, 100, 0) {
+				client.applySync(initialSync, false)
+			}
+			if restoreCtx.Err() == nil {
+				client.publish(nil, "")
+			}
+		}()
+	} else {
+		close(client.cacheReady)
 	}
 	return client, nil
 }
@@ -445,6 +466,14 @@ func (c *Client) mediaCachePath(mxc string) (string, error) {
 	return filepath.Join(c.MediaCacheDir(), name+"-"+hex.EncodeToString(sum[:8])), nil
 }
 
+func (c *Client) mediaCachePathFor(mxc string, encrypted bool) (string, error) {
+	path, err := c.mediaCachePath(mxc)
+	if err != nil || !encrypted {
+		return path, err
+	}
+	return path + ".encrypted", nil
+}
+
 func parseMXC(mxc string) (server, mediaID string, err error) {
 	rest, ok := strings.CutPrefix(strings.TrimSpace(mxc), "mxc://")
 	if !ok || rest == "" {
@@ -514,6 +543,20 @@ func (c *Client) ClearMediaCache() error {
 
 func (c *Client) Events() <-chan Update {
 	return c.events
+}
+
+func (c *Client) WaitForCache(ctx context.Context) error {
+	if c.cacheReady == nil {
+		return nil
+	}
+	select {
+	case <-c.cacheReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return errors.New("Matrix client is closed")
+	}
 }
 
 func (c *Client) IsLoggedIn() bool {
@@ -619,16 +662,24 @@ func (c *Client) HistoryPage(ctx context.Context, roomID string, before int64) (
 		page.Before = int64(events[len(events)-1].TimelineRowID)
 	}
 	messages := make([]Message, 0, len(events))
+	parsedTimelineEvents := 0
+	skippedEventTypes := make(map[string]int)
 	for i := len(events) - 1; i >= 0; i-- {
 		if message, ok := messageFromEvent(events[i]); ok {
 			messages = append(messages, message)
+			parsedTimelineEvents++
+		} else if events[i] != nil {
+			skippedEventTypes[events[i].GetType().Type]++
 		}
+	}
+	if parsedTimelineEvents == 0 {
+		log.Printf("Matrix history page has no parsed timeline messages: rows=%d skipped_event_types=%v", len(events), skippedEventTypes)
 	}
 	if before == 0 {
 		c.mu.Lock()
 		localMessages := c.local[roomID]
 		for key, message := range localMessages {
-			if containsMessage(messages, message) {
+			if containsMessage(messages, message) || shadowedByServerRow(messages, message) {
 				delete(localMessages, key)
 				continue
 			}
@@ -639,6 +690,7 @@ func (c *Client) HistoryPage(ctx context.Context, roomID string, before int64) (
 		}
 		c.mu.Unlock()
 	}
+	c.rememberMediaEncryption(messages)
 	c.populateMessageProfiles(ctx, roomID, messages)
 	for i := range messages {
 		messages[i].Own = c.isOwnMessage(messages[i])
@@ -776,6 +828,9 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 	defer finish()
+	if err = c.WaitForCache(ctx); err != nil {
+		return err
+	}
 	return c.startEngine(ctx)
 }
 
@@ -1229,6 +1284,7 @@ func (c *Client) Logout(ctx context.Context) error {
 	c.mu.Lock()
 	clear(c.rooms)
 	clear(c.local)
+	clear(c.mediaEncrypted)
 	c.mu.Unlock()
 	return nil
 }
@@ -1242,19 +1298,26 @@ func (c *Client) DownloadAvatar(ctx context.Context, mxc string) ([]byte, error)
 
 // CachedMediaBytes downloads media through the encrypted disk cache.
 func (c *Client) CachedMediaBytes(ctx context.Context, mxc string) ([]byte, error) {
-	message := Message{MediaURI: mxc}
-	// Resolve encryption metadata from any cached timeline copy.
+	return c.DownloadMedia(ctx, mxc, c.mediaEncryptionFor(mxc))
+}
+
+func (c *Client) mediaEncryptionFor(mxc string) *event.EncryptedFileInfo {
 	c.mu.RLock()
-	for _, messages := range c.local {
-		for _, candidate := range messages {
-			if candidate.MediaURI == mxc && candidate.MediaEncrypted != nil {
-				message.MediaEncrypted = candidate.MediaEncrypted
-				break
-			}
+	defer c.mu.RUnlock()
+	return c.mediaEncrypted[mxc]
+}
+
+func (c *Client) rememberMediaEncryption(messages []Message) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mediaEncrypted == nil {
+		c.mediaEncrypted = make(map[string]*event.EncryptedFileInfo)
+	}
+	for _, message := range messages {
+		if message.MediaURI != "" && message.MediaEncrypted != nil {
+			c.mediaEncrypted[message.MediaURI] = message.MediaEncrypted
 		}
 	}
-	c.mu.RUnlock()
-	return c.DownloadMedia(ctx, message.MediaURI, message.MediaEncrypted)
 }
 
 func (c *Client) DownloadMedia(ctx context.Context, mxc string, encrypted *event.EncryptedFileInfo) ([]byte, error) {
@@ -1291,13 +1354,13 @@ func (c *Client) DownloadMedia(ctx context.Context, mxc string, encrypted *event
 			return nil, fmt.Errorf("decrypt Matrix media: %w", err)
 		}
 	}
-	c.writeCachedMedia(mxc, data)
+	c.writeCachedMedia(mxc, data, encrypted != nil)
 	return data, nil
 }
 
 // CachedMediaPath returns the disk cache path for mxc when the file exists.
 func (c *Client) CachedMediaPath(mxc string) (string, bool) {
-	path, err := c.mediaCachePath(mxc)
+	path, err := c.mediaCachePathFor(mxc, c.mediaEncryptionFor(mxc) != nil)
 	if err != nil {
 		return "", false
 	}
@@ -1309,7 +1372,7 @@ func (c *Client) CachedMediaPath(mxc string) (string, bool) {
 
 func (c *Client) readCachedMedia(mxc string, encrypted bool) ([]byte, error) {
 	// Encrypted payloads are cached after decryption, so validate size before use.
-	path, err := c.mediaCachePath(mxc)
+	path, err := c.mediaCachePathFor(mxc, encrypted)
 	if err != nil {
 		return nil, err
 	}
@@ -1322,15 +1385,14 @@ func (c *Client) readCachedMedia(mxc string, encrypted bool) ([]byte, error) {
 		_ = os.Remove(path)
 		return nil, errors.New("cached Matrix media is invalid")
 	}
-	_ = encrypted
 	return data, nil
 }
 
-func (c *Client) writeCachedMedia(mxc string, data []byte) {
+func (c *Client) writeCachedMedia(mxc string, data []byte, encrypted bool) {
 	if len(data) == 0 {
 		return
 	}
-	path, err := c.mediaCachePath(mxc)
+	path, err := c.mediaCachePathFor(mxc, encrypted)
 	if err != nil {
 		return
 	}
@@ -1421,8 +1483,18 @@ func (c *Client) handleBackendEvent(raw any) {
 				message.Own = c.isOwnMessage(message)
 				if evt.Error != nil {
 					message.SendError = evt.Error.Error()
+					c.storeFailedMessage(evt.Event.RoomID.String(), message)
+				} else if evt.Event.SendError == "" || evt.Event.SendError == "not sent" {
+					// Send succeeded (or is still in flight with only the
+					// transient marker): drop the optimistic pending entry so
+					// the server-confirmed row takes over on next sync.
+					c.mu.Lock()
+					c.removeLocalMessageLocked(evt.Event.RoomID.String(), evt.Event)
+					c.mu.Unlock()
+				} else {
+					message.SendError = evt.Event.SendError
+					c.storeFailedMessage(evt.Event.RoomID.String(), message)
 				}
-				c.storeLocalMessage(evt.Event.RoomID.String(), message)
 			}
 			c.sendMu.Unlock()
 			errorMessage := ""
@@ -1527,7 +1599,7 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 			}
 		}
 		for _, evt := range syncRoom.Events {
-			c.removeLocalMessage(key, evt)
+			c.removeLocalMessageLocked(key, evt)
 			if evt != nil && !evt.Timestamp.Time.Before(room.LastEventAt) {
 				room.LastEventAt = evt.Timestamp.Time
 				room.LastEventID = evt.ID.String()
@@ -1682,24 +1754,118 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		return Message{}, false
 	}
 	var content struct {
-		Body          string                   `json:"body"`
-		FormattedBody string                   `json:"formatted_body"`
-		URL           string                   `json:"url"`
-		File          *event.EncryptedFileInfo `json:"file"`
-		Info          *event.FileInfo          `json:"info"`
-		RelatesTo     struct {
+		MsgType string `json:"msgtype"`
+		Body    string `json:"body"`
+		Text    []struct {
+			Body     string `json:"body"`
+			MIMEType string `json:"mimetype"`
+		} `json:"m.text"`
+		FormattedBody        string                       `json:"formatted_body"`
+		URL                  string                       `json:"url"`
+		File                 *event.EncryptedFileInfo     `json:"file"`
+		Info                 *event.FileInfo              `json:"info"`
+		FileName             string                       `json:"filename"`
+		BeeperGalleryImages  []*event.MessageEventContent `json:"com.beeper.gallery.images"`
+		BeeperGalleryCaption string                       `json:"com.beeper.gallery.caption"`
+		RelatesTo            struct {
 			EventID   string `json:"event_id"`
 			InReplyTo struct {
 				EventID string `json:"event_id"`
 			} `json:"m.in_reply_to"`
 		} `json:"m.relates_to"`
 	}
-	if err := json.Unmarshal(evt.GetContent(), &content); err != nil || content.Body == "" {
+	if err := json.Unmarshal(evt.GetContent(), &content); err != nil {
 		return Message{}, false
 	}
 	mediaURI := content.URL
+	mediaEncrypted := content.File
+	mediaInfo := content.Info
+	mediaType := content.MsgType
 	if mediaURI == "" && content.File != nil {
 		mediaURI = string(content.File.URL)
+	}
+	if content.MsgType == string(event.MsgBeeperGallery) {
+		// The timeline row has one inline media slot, so display the first image in an album.
+		for _, galleryImage := range content.BeeperGalleryImages {
+			if galleryImage == nil {
+				continue
+			}
+			galleryMIME := mediaMIME(galleryImage.Info)
+			if galleryImage.MsgType != event.MsgImage && !strings.HasPrefix(galleryMIME, "image/") {
+				continue
+			}
+			galleryURI := string(galleryImage.URL)
+			if galleryURI == "" && galleryImage.File != nil {
+				galleryURI = string(galleryImage.File.URL)
+			}
+			if galleryURI == "" {
+				continue
+			}
+			mediaURI = galleryURI
+			mediaEncrypted = galleryImage.File
+			mediaInfo = galleryImage.Info
+			mediaType = string(galleryImage.MsgType)
+			break
+		}
+	}
+	mediaMIMEType := mediaMIME(mediaInfo)
+	if !strings.HasPrefix(mediaMIMEType, "image/") &&
+		(mediaType == string(event.MsgImage) || evtType == event.EventSticker.Type) {
+		mediaMIMEType = "image/unknown"
+	}
+	body := content.Body
+	if body == "" {
+		body = content.BeeperGalleryCaption
+	}
+	if body == "" {
+		var fallbackText string
+		for _, representation := range content.Text {
+			if representation.Body == "" {
+				continue
+			}
+			if fallbackText == "" {
+				fallbackText = representation.Body
+			}
+			if representation.MIMEType == "" || representation.MIMEType == "text/plain" {
+				body = representation.Body
+				break
+			}
+		}
+		if body == "" {
+			body = fallbackText
+		}
+	}
+	if body == "" {
+		body = content.FileName
+	}
+	if body == "" {
+		switch mediaType {
+		case string(event.MsgImage):
+			body = "Image"
+		case string(event.MsgVideo):
+			body = "Video"
+		case string(event.MsgAudio):
+			body = "Audio"
+		case string(event.MsgFile):
+			body = "File"
+		case string(event.MsgBeeperGallery):
+			body = "Media album"
+		}
+	}
+	if body == "" && mediaURI != "" {
+		body = "Attachment"
+	}
+	if body == "" {
+		return Message{}, false
+	}
+	mediaMessage := mediaURI != "" || mediaType == string(event.MsgImage) ||
+		mediaType == string(event.MsgVideo) || mediaType == string(event.MsgAudio) ||
+		mediaType == string(event.MsgFile) || mediaType == string(event.MsgBeeperGallery) ||
+		evtType == event.EventSticker.Type
+	if mediaMessage {
+		log.Printf("Matrix media mapped: msgtype=%q uri_present=%t mime=%q encrypted=%t inline_candidate=%t dimensions=%dx%d",
+			mediaType, mediaURI != "", mediaMIMEType, mediaEncrypted != nil,
+			mediaURI != "" && strings.HasPrefix(mediaMIMEType, "image/"), mediaWidth(mediaInfo), mediaHeight(mediaInfo))
 	}
 	replyTo := content.RelatesTo.EventID
 	if replyTo == "" {
@@ -1723,24 +1889,24 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		ID:              evt.ID.String(),
 		TransactionID:   evt.TransactionID,
 		Sender:          evt.Sender.String(),
-		Body:            content.Body,
+		Body:            body,
 		FormattedBody:   content.FormattedBody,
 		ReplyToEventID:  replyTo,
 		Timestamp:       evt.Timestamp.Time,
 		TimelineCursor:  int64(evt.TimelineRowID),
 		Sending:         evt.SendError == "not sent",
-		SendError:       evt.SendError,
+		SendError:       mapSendError(evt.SendError),
 		Reactions:       evt.Reactions,
 		Reacted:         map[string]bool{},
 		MediaURI:        mediaURI,
-		MediaEncrypted:  content.File,
-		MediaMIME:       mediaMIME(content.Info),
-		MediaSize:       mediaSize(content.Info),
-		MediaWidth:      mediaWidth(content.Info),
-		MediaHeight:     mediaHeight(content.Info),
-		MediaDurationMs: mediaDuration(content.Info),
+		MediaEncrypted:  mediaEncrypted,
+		MediaMIME:       mediaMIMEType,
+		MediaSize:       mediaSize(mediaInfo),
+		MediaWidth:      mediaWidth(mediaInfo),
+		MediaHeight:     mediaHeight(mediaInfo),
+		MediaDurationMs: mediaDuration(mediaInfo),
 		Encrypted:       evt.MegolmSessionID != "",
-		Edited:          evt.LastEditRowID != nil,
+		Edited:          isEditedEvent(evt),
 		EditHistory:     editHistory(evt),
 	}, true
 }
@@ -1783,8 +1949,30 @@ func mediaDuration(info *event.FileInfo) int {
 // editHistory reports prior edit sources when available. gomuks only stores
 // the current edit source, so this is a placeholder that surfaces "(edited)"
 // detail when the SDK exposes more history in the future.
-func editHistory(evt *database.Event) []string {
+// mapSendError converts the database send marker into a user-facing error.
+// gomuks stores the transient "not sent" marker on every fresh local event and
+// (upstream) never clears it on success, so it must not surface as an error.
+// Only genuine failures (encrypt/send errors) are reported; the pending state
+// is conveyed through Message.Sending instead.
+func mapSendError(sendError string) string {
+	if sendError == "" || sendError == "not sent" {
+		return ""
+	}
+	return sendError
+}
+
+// isEditedEvent reports whether the event was actually edited. gomuks
+// initializes LastEditRowID to a non-nil zero pointer on fresh sends, so a
+// nil check alone flags brand-new messages as edited.
+func isEditedEvent(evt *database.Event) bool {
 	if evt == nil || evt.LastEditRowID == nil {
+		return false
+	}
+	return *evt.LastEditRowID != 0
+}
+
+func editHistory(evt *database.Event) []string {
+	if !isEditedEvent(evt) {
 		return nil
 	}
 	if local := evt.LocalContent; local != nil && strings.TrimSpace(local.EditSource) != "" {
@@ -1799,6 +1987,12 @@ func (c *Client) storeLocalMessage(roomID string, message Message) {
 		key = message.ID
 	}
 	c.mu.Lock()
+	if message.MediaURI != "" && message.MediaEncrypted != nil {
+		if c.mediaEncrypted == nil {
+			c.mediaEncrypted = make(map[string]*event.EncryptedFileInfo)
+		}
+		c.mediaEncrypted[message.MediaURI] = message.MediaEncrypted
+	}
 	if c.local[roomID] == nil {
 		c.local[roomID] = make(map[string]Message)
 	}
@@ -1839,6 +2033,12 @@ func (c *Client) removeLocalMessage(roomID string, evt *database.Event) {
 	if evt == nil {
 		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeLocalMessageLocked(roomID, evt)
+}
+
+func (c *Client) removeLocalMessageLocked(roomID string, evt *database.Event) {
 	messages := c.local[roomID]
 	for key, message := range messages {
 		if message.ID == evt.ID.String() ||
@@ -1849,6 +2049,43 @@ func (c *Client) removeLocalMessage(roomID string, evt *database.Event) {
 	if len(messages) == 0 {
 		delete(c.local, roomID)
 	}
+}
+
+// storeFailedMessage keeps a genuinely failed send visible (with its error)
+// under both the transaction-ID and event-ID keys so the timeline and the
+// retry lookup can find it regardless of which identifier the UI holds.
+func (c *Client) storeFailedMessage(roomID string, message Message) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.local[roomID] == nil {
+		c.local[roomID] = make(map[string]Message)
+	}
+	if message.TransactionID != "" {
+		c.local[roomID][message.TransactionID] = message
+	}
+	if message.ID != "" {
+		c.local[roomID][message.ID] = message
+	}
+}
+
+// shadowedByServerRow reports whether a server-confirmed row already covers a
+// local optimistic entry whose IDs no longer line up (e.g. the server echo
+// arrived with a real event ID while the pending entry still carries the
+// local ~txn ID, or vice versa). Matching on sender+body+timestamp proximity
+// avoids leaving a stale "Sending..." duplicate next to the confirmed copy.
+func shadowedByServerRow(messages []Message, candidate Message) bool {
+	if candidate.ID == "" || !candidate.Sending {
+		return false
+	}
+	for _, message := range messages {
+		if message.Sending || message.Sender != candidate.Sender || message.Body != candidate.Body {
+			continue
+		}
+		if message.ID != "" && !strings.HasPrefix(message.ID, "~") {
+			return true
+		}
+	}
+	return false
 }
 
 func containsMessage(messages []Message, candidate Message) bool {
@@ -1867,6 +2104,7 @@ func (c *Client) publish(changed []string, errMessage string) {
 		ChangedRoomID:       append([]string(nil), changed...),
 		Error:               errMessage,
 		InitialSyncComplete: c.SyncReady(),
+		NeedsVerification:   c.engine != nil && c.NeedsVerification(),
 		ConnectionState:     c.ConnectionState(),
 	}
 	c.mu.Lock()
@@ -1898,7 +2136,7 @@ func (c *Client) publish(changed []string, errMessage string) {
 	default:
 	}
 
-	// Keep the callback non-blocking even if Fyne is busy rendering. The next
+	// Keep the callback non-blocking even if the UI is busy rendering. The next
 	// delivered update contains the newest room snapshot and all pending IDs.
 	changedSet := make(map[string]struct{}, len(update.ChangedRoomID))
 	timelineChangedSet := make(map[string]struct{}, len(update.TimelineChangedRoomID))
