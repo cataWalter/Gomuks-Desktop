@@ -43,13 +43,16 @@ func TestPreferenceStoreLoadsAndPersistsValues(t *testing.T) {
 	if err = store.Set("appearance.theme", "Light"); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
+	if err = store.Set("history.initial_messages", "250"); err != nil {
+		t.Fatalf("Set() history.initial_messages error = %v", err)
+	}
 
 	reloaded, err := NewPreferenceStore(path)
 	if err != nil {
 		t.Fatalf("reload preferences: %v", err)
 	}
 	values := reloaded.All()
-	if values["appearance.theme"] != "Light" || values["room.favorite.!room:example.org"] != true || values["future.preference"] != "preserved" {
+	if values["appearance.theme"] != "Light" || values["room.favorite.!room:example.org"] != true || values["history.initial_messages"] != "250" || values["future.preference"] != "preserved" {
 		t.Fatalf("persisted values = %#v", values)
 	}
 	info, err := os.Stat(path)
@@ -58,6 +61,18 @@ func TestPreferenceStoreLoadsAndPersistsValues(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("preferences permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestPreferenceStoreAcceptsAdditionalThemes(t *testing.T) {
+	store, err := NewPreferenceStore(filepath.Join(t.TempDir(), "preferences.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, theme := range []string{"Bosco", "Rosa"} {
+		if err = store.Set("appearance.theme", theme); err != nil {
+			t.Errorf("Set(appearance.theme, %q) error = %v", theme, err)
+		}
 	}
 }
 
@@ -74,6 +89,7 @@ func TestPreferenceStoreRejectsInvalidWrites(t *testing.T) {
 		{key: "appearance.compact", value: "yes"},
 		{key: "room.favorite.", value: true},
 		{key: "room.muted.!room:example.org", value: "yes"},
+		{key: "history.initial_messages", value: "12"},
 		{key: "unknown.key", value: true},
 	}
 	for _, test := range tests {

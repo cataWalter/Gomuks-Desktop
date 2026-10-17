@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"go.mau.fi/gomuks/pkg/hicli/database"
 	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
 	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/jsontime"
 	"maunium.net/go/mautrix"
 	mautrixcrypto "maunium.net/go/mautrix/crypto"
 	"maunium.net/go/mautrix/crypto/attachment"
@@ -36,8 +38,29 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+type SearchRequest struct {
+	Query        string
+	RoomID       string
+	Sender       string
+	MinTimestamp int64
+	MaxTimestamp int64
+	Limit        int
+	NextBatch    string
+}
+
+type SearchResult struct {
+	RoomID  string
+	Message Message
+}
+
+type SearchPage struct {
+	Results   []SearchResult
+	NextBatch string
+}
+
 const eventBufferSize = 256
 const timelinePageSize = 100
+const defaultInitialHistoryLimit = 100
 const maxReactedEvents = 200
 
 // Reconnect backoff bounds used when (re)starting Matrix sync after a failure.
@@ -110,6 +133,10 @@ type Message struct {
 	Edited          bool
 	EditHistory     []string
 	Redacted        bool
+
+	MediaType               string
+	MediaThumbnailURI       string
+	MediaThumbnailEncrypted *event.EncryptedFileInfo
 }
 
 type Member struct {
@@ -206,6 +233,11 @@ type Client struct {
 // New opens gomuks' SQLite stores and restores the cached account if present.
 // Cached room metadata is loaded asynchronously; network syncing is started by Start.
 func New(databasePath string) (*Client, error) {
+	return NewWithLogOutput(databasePath, os.Stderr)
+}
+
+// NewWithLogOutput is New with gomuks engine logs written to logOutput.
+func NewWithLogOutput(databasePath string, logOutput io.Writer) (*Client, error) {
 	databasePath, err := filepath.Abs(databasePath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve Matrix database path: %w", err)
@@ -252,7 +284,7 @@ func New(databasePath string) (*Client, error) {
 		mediaCacheDir:        defaultMediaCacheDir(dataDir),
 	}
 	client.lifecycleCtx, client.lifecycleCancel = context.WithCancel(context.Background())
-	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
+	logger := zerolog.New(logOutput).With().Timestamp().Logger()
 	// hicli is gomuks' embeddable Matrix engine; its callback is invoked from
 	// sync and decryption goroutines, so it only publishes immutable snapshots.
 	client.engine = hicli.New(rawDB, nil, logger, pickleKey, client.handleBackendEvent)
@@ -647,19 +679,102 @@ func (c *Client) Messages(ctx context.Context, roomID string) ([]Message, error)
 	return page.Messages, nil
 }
 
+func timelineMessagePrefix(events []*database.Event, limit int) (int, int) {
+	messageCount := 0
+	for index, evt := range events {
+		if _, ok := messageFromEvent(evt); !ok {
+			continue
+		}
+		messageCount++
+		if messageCount == limit {
+			return index + 1, messageCount
+		}
+	}
+	return len(events), messageCount
+}
+
+func isTimelineEvent(timeline []database.TimelineRowTuple, rowID database.EventRowID) bool {
+	for _, tuple := range timeline {
+		if tuple.Event == rowID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasServerHistory(room *database.Room) bool {
+	return room != nil && room.PrevBatch != "" && room.PrevBatch != database.PrevBatchPaginationComplete
+}
+
 func (c *Client) HistoryPage(ctx context.Context, roomID string, before int64) (HistoryPage, error) {
+	return c.HistoryPageWithLimit(ctx, roomID, before, defaultInitialHistoryLimit)
+}
+
+func (c *Client) HistoryPageWithLimit(ctx context.Context, roomID string, before int64, initialLimit int) (HistoryPage, error) {
 	ctx, finish, err := c.beginOperation(ctx)
 	if err != nil {
 		return HistoryPage{}, err
 	}
 	defer finish()
-	events, err := c.engine.DB.Timeline.Get(ctx, id.RoomID(roomID), timelinePageSize, database.TimelineRowID(before))
-	if err != nil {
-		return HistoryPage{}, fmt.Errorf("read room timeline: %w", err)
+	page := HistoryPage{}
+	var events []*database.Event
+	if before == 0 {
+		if initialLimit < 1 {
+			initialLimit = defaultInitialHistoryLimit
+		}
+		cursor := database.TimelineRowID(0)
+		remaining := initialLimit
+		for {
+			batch, getErr := c.engine.DB.Timeline.Get(ctx, id.RoomID(roomID), timelinePageSize, cursor)
+			if getErr != nil {
+				return HistoryPage{}, fmt.Errorf("read room timeline: %w", getErr)
+			}
+			if len(batch) == 0 {
+				break
+			}
+
+			prefixLength, messageCount := timelineMessagePrefix(batch, remaining)
+			events = append(events, batch[:prefixLength]...)
+			if messageCount == remaining {
+				page.Before = int64(batch[prefixLength-1].TimelineRowID)
+				page.HasMore = prefixLength < len(batch) || len(batch) == timelinePageSize
+				break
+			}
+
+			page.Before = int64(batch[len(batch)-1].TimelineRowID)
+			remaining -= messageCount
+			if len(batch) < timelinePageSize {
+				break
+			}
+			cursor = database.TimelineRowID(page.Before)
+		}
+	} else {
+		var getErr error
+		events, getErr = c.engine.DB.Timeline.Get(ctx, id.RoomID(roomID), timelinePageSize, database.TimelineRowID(before))
+		if getErr != nil {
+			return HistoryPage{}, fmt.Errorf("read room timeline: %w", getErr)
+		}
+		page.HasMore = len(events) == timelinePageSize
+		if len(events) > 0 {
+			page.Before = int64(events[len(events)-1].TimelineRowID)
+		}
 	}
-	page := HistoryPage{HasMore: len(events) == timelinePageSize}
-	if len(events) > 0 {
-		page.Before = int64(events[len(events)-1].TimelineRowID)
+	room, getErr := c.engine.DB.Room.Get(ctx, id.RoomID(roomID))
+	if getErr != nil {
+		return HistoryPage{}, fmt.Errorf("read room history pagination state: %w", getErr)
+	}
+	if before != 0 && len(events) == 0 && hasServerHistory(room) {
+		pagination, paginateErr := c.engine.Paginate(ctx, id.RoomID(roomID), database.TimelineRowID(before), timelinePageSize, false)
+		if paginateErr != nil {
+			return HistoryPage{}, fmt.Errorf("paginate older room history: %w", paginateErr)
+		}
+		events = pagination.Events
+		page.HasMore = pagination.HasMore
+		if len(events) > 0 {
+			page.Before = int64(events[len(events)-1].TimelineRowID)
+		}
+	} else {
+		page.HasMore = page.HasMore || hasServerHistory(room)
 	}
 	messages := make([]Message, 0, len(events))
 	parsedTimelineEvents := 0
@@ -1177,36 +1292,77 @@ func (c *Client) SetTyping(ctx context.Context, roomID string, timeout time.Dura
 	return nil
 }
 
-func (c *Client) SearchMessages(ctx context.Context, roomID, query string, limit int) ([]Message, error) {
-	query = strings.TrimSpace(query)
+func localSearchParams(request SearchRequest) (*jsoncmd.SearchParams, error) {
+	query := strings.TrimSpace(request.Query)
 	if query == "" {
 		return nil, errors.New("message search query is empty")
 	}
+	limit := request.Limit
 	if limit < 1 || limit > 100 {
 		limit = 50
 	}
-	ctx, finish, err := c.beginOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer finish()
-	response, err := c.engine.SearchLocal(ctx, &jsoncmd.SearchParams{
+	params := &jsoncmd.SearchParams{
 		SearchTerm: query,
-		RoomIDs:    []id.RoomID{id.RoomID(roomID)},
 		Limit:      limit,
 		SortByTime: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("search local Matrix history: %w", err)
+		NextBatch:  request.NextBatch,
 	}
-	messages := make([]Message, 0, len(response.Events))
-	for _, evt := range response.Events {
-		if message, ok := messageFromEvent(evt); ok {
-			messages = append(messages, message)
+	if request.RoomID != "" {
+		params.RoomIDs = []id.RoomID{id.RoomID(request.RoomID)}
+	}
+	if request.Sender != "" {
+		params.Senders = []id.UserID{id.UserID(request.Sender)}
+	}
+	if request.MinTimestamp > 0 {
+		params.MinTimestamp = jsontime.UnixMilli{Time: time.UnixMilli(request.MinTimestamp)}
+	}
+	if request.MaxTimestamp > 0 {
+		params.MaxTimestamp = jsontime.UnixMilli{Time: time.UnixMilli(request.MaxTimestamp)}
+	}
+	return params, nil
+}
+
+func (c *Client) SearchMessages(ctx context.Context, request SearchRequest) (SearchPage, error) {
+	params, err := localSearchParams(request)
+	if err != nil {
+		return SearchPage{}, err
+	}
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return SearchPage{}, err
+	}
+	defer finish()
+	response, err := c.engine.SearchLocal(ctx, params)
+	if err != nil {
+		return SearchPage{}, fmt.Errorf("search local Matrix history: %w", err)
+	}
+	results := make([]SearchResult, 0, len(response.Events))
+	profileMessages := make(map[string][]Message)
+	profileResultIndexes := make(map[string][]int)
+	for _, eventResult := range response.Events {
+		if message, ok := messageFromEvent(eventResult); ok {
+			roomID := eventResult.RoomID.String()
+			var timelineCursor database.TimelineRowID
+			cursorErr := c.engine.DB.Timeline.GetDB().QueryRow(ctx,
+				"SELECT rowid FROM timeline WHERE room_id = ? AND event_rowid = ?",
+				eventResult.RoomID, eventResult.RowID,
+			).Scan(&timelineCursor)
+			if cursorErr != nil && !errors.Is(cursorErr, sql.ErrNoRows) {
+				return SearchPage{}, fmt.Errorf("find searched message in room timeline: %w", cursorErr)
+			}
+			message.TimelineCursor = int64(timelineCursor)
+			profileMessages[roomID] = append(profileMessages[roomID], message)
+			profileResultIndexes[roomID] = append(profileResultIndexes[roomID], len(results))
+			results = append(results, SearchResult{RoomID: roomID, Message: message})
 		}
 	}
-	c.populateMessageProfiles(ctx, roomID, messages)
-	return messages, nil
+	for roomID, messages := range profileMessages {
+		c.populateMessageProfiles(ctx, roomID, messages)
+		for index, message := range messages {
+			results[profileResultIndexes[roomID][index]].Message = message
+		}
+	}
+	return SearchPage{Results: results, NextBatch: response.NextBatch}, nil
 }
 
 func (c *Client) RoomMembers(ctx context.Context, roomID string) ([]Member, error) {
@@ -1293,7 +1449,15 @@ func (c *Client) DownloadAvatar(ctx context.Context, mxc string) ([]byte, error)
 	if strings.TrimSpace(mxc) == "" {
 		return nil, nil
 	}
-	return c.DownloadMedia(ctx, mxc, nil)
+	data, err := c.DownloadMedia(ctx, mxc, nil)
+	if isMissingMatrixMediaError(err) {
+		return nil, nil
+	}
+	return data, err
+}
+
+func isMissingMatrixMediaError(err error) bool {
+	return errors.Is(err, mautrix.MNotFound)
 }
 
 // CachedMediaBytes downloads media through the encrypted disk cache.
@@ -1316,6 +1480,9 @@ func (c *Client) rememberMediaEncryption(messages []Message) {
 	for _, message := range messages {
 		if message.MediaURI != "" && message.MediaEncrypted != nil {
 			c.mediaEncrypted[message.MediaURI] = message.MediaEncrypted
+		}
+		if message.MediaThumbnailURI != "" && message.MediaThumbnailEncrypted != nil {
+			c.mediaEncrypted[message.MediaThumbnailURI] = message.MediaThumbnailEncrypted
 		}
 	}
 }
@@ -1457,6 +1624,7 @@ func (c *Client) handleBackendEvent(raw any) {
 	case *jsoncmd.SyncComplete:
 		c.applySync(evt, true)
 	case *jsoncmd.EventsDecrypted:
+		c.refreshRoomFromTimeline(evt.RoomID.String())
 		c.publishTimeline([]string{evt.RoomID.String()}, "")
 	case *jsoncmd.Typing:
 		roomID := evt.RoomID.String()
@@ -1487,9 +1655,26 @@ func (c *Client) handleBackendEvent(raw any) {
 				} else if evt.Event.SendError == "" || evt.Event.SendError == "not sent" {
 					// Send succeeded (or is still in flight with only the
 					// transient marker): drop the optimistic pending entry so
-					// the server-confirmed row takes over on next sync.
+					// the server-confirmed row takes over on next sync, but keep
+					// the sidebar preview on the sent text.
 					c.mu.Lock()
-					c.removeLocalMessageLocked(evt.Event.RoomID.String(), evt.Event)
+					roomID := evt.Event.RoomID.String()
+					c.removeLocalMessageLocked(roomID, evt.Event)
+					if room, ok := c.rooms[roomID]; ok {
+						if message.Body != "" && !message.Timestamp.Before(room.LastSeen) {
+							room.LastSeen = message.Timestamp
+							room.Preview = message.Body
+						}
+						if !message.Timestamp.Before(room.LastEventAt) {
+							room.LastEventAt = message.Timestamp
+							room.LastEventID = evt.Event.ID.String()
+							if message.Sender != "" {
+								room.LastEventSender = message.Sender
+							}
+							room.Unanswered = roomNeedsReply(room, c.currentUserID(), c.dismissedEvents[roomID])
+						}
+						c.rooms[roomID] = room
+					}
 					c.mu.Unlock()
 				} else {
 					message.SendError = evt.Event.SendError
@@ -1537,6 +1722,7 @@ func (c *Client) handleBackendEvent(raw any) {
 }
 
 func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
+	roomAvatars := c.directRoomAvatars(syncEvent)
 	changed := make([]string, 0, len(syncEvent.Rooms)+len(syncEvent.LeftRooms))
 	c.mu.Lock()
 	for roomID, syncRoom := range syncEvent.Rooms {
@@ -1556,7 +1742,10 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 			if meta.Avatar != nil {
 				room.Avatar = meta.Avatar.String()
 			}
-			room.Direct = meta.DMUserID != nil
+			if avatar, ok := roomAvatars[key]; ok && (meta.Avatar == nil || room.Avatar == "") {
+				room.Avatar = avatar
+			}
+			room.Direct = isDirectRoom(meta)
 			room.Unread = meta.UnreadMessages + meta.UnreadNotifications
 			room.Mentions = meta.UnreadHighlights
 			room.Bridge = bridgeLabel(meta)
@@ -1565,6 +1754,9 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 			}
 		}
 		if notify && (syncRoom.Reset || len(syncRoom.Timeline) > 0) {
+			if c.pendingTimelineRooms == nil {
+				c.pendingTimelineRooms = make(map[string]struct{})
+			}
 			c.pendingTimelineRooms[key] = struct{}{}
 		}
 		if notify {
@@ -1598,20 +1790,50 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 				}
 			}
 		}
+		// gomuks decides which event is a room's preview server-side
+		// (room.preview_event_rowid, using the same eligibility rules the
+		// timeline uses). Prefer that answer so the sidebar text is always the
+		// event the open chat shows, rather than re-deriving it from whatever
+		// happens to arrive in this payload.
+		previewResolved := false
+		if meta := syncRoom.Meta; meta != nil && meta.PreviewEventRowID != 0 {
+			for _, evt := range syncRoom.Events {
+				if evt == nil || evt.RowID != meta.PreviewEventRowID {
+					continue
+				}
+				if preview, ok := messageFromEvent(evt); ok && preview.Body != "" {
+					room.Preview = preview.Body
+					previewResolved = true
+				}
+				break
+			}
+		}
 		for _, evt := range syncRoom.Events {
+			if evt == nil {
+				continue
+			}
 			c.removeLocalMessageLocked(key, evt)
-			if evt != nil && !evt.Timestamp.Time.Before(room.LastEventAt) {
+			if !evt.Timestamp.Time.Before(room.LastEventAt) {
 				room.LastEventAt = evt.Timestamp.Time
 				room.LastEventID = evt.ID.String()
 				room.LastEventSender = evt.Sender.String()
 			}
-			message, ok := messageFromEvent(evt)
-			if !ok {
-				continue
+			inTimeline := isTimelineEvent(syncRoom.Timeline, evt.RowID)
+			if message, ok := messageFromEvent(evt); ok && !previewResolved && evt.CanUseForPreview() {
+				// Timeline membership keeps stale rows resent in `events` from
+				// moving the preview backwards, but a freshly sent own message
+				// may not have a timeline row yet, so let it seed an empty
+				// preview instead of leaving the topic fallback in place.
+				if room.Preview == "" || (inTimeline && !message.Timestamp.Before(room.LastSeen)) {
+					room.LastSeen = message.Timestamp
+					room.Preview = message.Body
+				}
 			}
-			if room.Preview == "" || message.Timestamp.After(room.LastSeen) {
-				room.LastSeen = message.Timestamp
-				room.Preview = message.Body
+			if notify && inTimeline {
+				if c.pendingTimelineRooms == nil {
+					c.pendingTimelineRooms = make(map[string]struct{})
+				}
+				c.pendingTimelineRooms[key] = struct{}{}
 			}
 		}
 		room.Unanswered = roomNeedsReply(room, c.currentUserID(), c.dismissedEvents[key])
@@ -1627,6 +1849,75 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 	if notify && len(changed) > 0 {
 		c.publish(changed, "")
 	}
+}
+
+func (c *Client) directRoomAvatars(syncEvent *jsoncmd.SyncComplete) map[string]string {
+	if c.engine == nil {
+		return nil
+	}
+
+	keys := make([]database.RoomStateGUID, 0, len(syncEvent.Rooms))
+	roomIDs := make(map[string]struct{}, len(syncEvent.Rooms))
+	for roomID, syncRoom := range syncEvent.Rooms {
+		if syncRoom == nil || syncRoom.Meta == nil || syncRoom.Meta.DMUserID == nil ||
+			(syncRoom.Meta.Avatar != nil && syncRoom.Meta.Avatar.String() != "") {
+			continue
+		}
+		keys = append(keys, database.RoomStateGUID{
+			RoomID:   roomID,
+			Type:     event.StateMember,
+			StateKey: syncRoom.Meta.DMUserID.String(),
+		})
+		roomIDs[roomID.String()] = struct{}{}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	ctx, finish, err := c.beginOperation(context.Background())
+	if err != nil {
+		return nil
+	}
+	defer finish()
+
+	members, err := c.engine.DB.CurrentState.GetMany(ctx, keys)
+	if err != nil {
+		log.Printf("read Matrix direct-message avatars: %v", err)
+		return nil
+	}
+	avatars := make(map[string]string, len(roomIDs))
+	for roomID := range roomIDs {
+		avatars[roomID] = ""
+	}
+	for _, member := range members {
+		if member.StateKey == nil {
+			continue
+		}
+		var profile event.MemberEventContent
+		if err = json.Unmarshal(member.GetContent(), &profile); err != nil {
+			log.Printf("decode Matrix member profile in room %s: %v", member.RoomID, err)
+			continue
+		}
+		avatars[member.RoomID.String()] = string(profile.AvatarURL)
+	}
+	return avatars
+}
+
+func isDirectRoom(room *database.Room) bool {
+	if room == nil {
+		return false
+	}
+	if room.DMUserID != nil {
+		return true
+	}
+	if room.LazyLoadSummary == nil || room.LazyLoadSummary.JoinedMemberCount == nil {
+		return false
+	}
+	memberCount := *room.LazyLoadSummary.JoinedMemberCount
+	if room.LazyLoadSummary.InvitedMemberCount != nil {
+		memberCount += *room.LazyLoadSummary.InvitedMemberCount
+	}
+	return memberCount == 2
 }
 
 func (c *Client) populateMessageProfiles(ctx context.Context, roomID string, messages []Message) {
@@ -1732,6 +2023,9 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		return Message{}, false
 	}
 	evtType := evt.GetType().Type
+	if evtType != event.EventMessage.Type && evtType != event.EventSticker.Type && evtType != event.EventEncrypted.Type {
+		return Message{}, false
+	}
 	if evt.RedactedBy != "" {
 		return Message{
 			ID:        evt.ID.String(),
@@ -1750,7 +2044,7 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 			DecryptionError: evt.DecryptionError,
 		}, true
 	}
-	if evtType != event.EventMessage.Type && evtType != event.EventSticker.Type {
+	if evtType == event.EventEncrypted.Type {
 		return Message{}, false
 	}
 	var content struct {
@@ -1894,7 +2188,7 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		ReplyToEventID:  replyTo,
 		Timestamp:       evt.Timestamp.Time,
 		TimelineCursor:  int64(evt.TimelineRowID),
-		Sending:         evt.SendError == "not sent",
+		Sending:         isPendingEvent(evt),
 		SendError:       mapSendError(evt.SendError),
 		Reactions:       evt.Reactions,
 		Reacted:         map[string]bool{},
@@ -1908,7 +2202,52 @@ func messageFromEvent(evt *database.Event) (Message, bool) {
 		Encrypted:       evt.MegolmSessionID != "",
 		Edited:          isEditedEvent(evt),
 		EditHistory:     editHistory(evt),
+
+		MediaType:               mediaType,
+		MediaThumbnailURI:       mediaThumbnailURI(mediaInfo),
+		MediaThumbnailEncrypted: mediaThumbnailEncrypted(mediaInfo),
 	}, true
+}
+
+// refreshRoomFromTimeline re-derives the sidebar preview from the newest
+// timeline message persisted in the DB. It is used after decryption completes:
+// the sync-time Events payload often carries the still-encrypted stub (which
+// messageFromEvent skips), so the preview would otherwise stay behind the
+// open timeline until the next sync.
+func (c *Client) refreshRoomFromTimeline(roomID string) {
+	ctx, finish, err := c.beginOperation(context.Background())
+	if err != nil {
+		return
+	}
+	defer finish()
+	events, err := c.engine.DB.Timeline.Get(ctx, id.RoomID(roomID), 20, 0)
+	if err != nil || len(events) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	room, ok := c.rooms[roomID]
+	if !ok {
+		return
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		message, ok := messageFromEvent(events[i])
+		if !ok {
+			continue
+		}
+		if room.Preview == "" || !message.Timestamp.Before(room.LastSeen) {
+			room.LastSeen = message.Timestamp
+			room.Preview = message.Body
+		}
+		if events[i] != nil && !events[i].Timestamp.Time.Before(room.LastEventAt) {
+			room.LastEventAt = events[i].Timestamp.Time
+			room.LastEventID = events[i].ID.String()
+			room.LastEventSender = events[i].Sender.String()
+		}
+		break
+	}
+	room.Unanswered = roomNeedsReply(room, c.currentUserID(), c.dismissedEvents[roomID])
+	c.rooms[roomID] = room
 }
 
 func mediaMIME(info *event.FileInfo) string {
@@ -1916,6 +2255,26 @@ func mediaMIME(info *event.FileInfo) string {
 		return ""
 	}
 	return info.MimeType
+}
+
+func mediaThumbnailURI(info *event.FileInfo) string {
+	if info == nil {
+		return ""
+	}
+	if info.ThumbnailURL != "" {
+		return string(info.ThumbnailURL)
+	}
+	if info.ThumbnailFile != nil {
+		return string(info.ThumbnailFile.URL)
+	}
+	return ""
+}
+
+func mediaThumbnailEncrypted(info *event.FileInfo) *event.EncryptedFileInfo {
+	if info == nil {
+		return nil
+	}
+	return info.ThumbnailFile
 }
 
 func mediaSize(info *event.FileInfo) int {
@@ -1961,6 +2320,22 @@ func mapSendError(sendError string) string {
 	return sendError
 }
 
+// isPendingEvent reports whether an event is still an unsent local echo.
+//
+// send_error alone cannot answer this: gomuks writes the transient "not sent"
+// marker into every fresh local event and its deferred cleanup in
+// actuallySend() re-writes it after a successful send too (UpdateID clears the
+// column, then the defer persists the still-set in-memory "not sent" value).
+// Upstream knows this and its Resend() checks for the "~" local placeholder
+// prefix on the event ID instead, so that is the reliable pending signal here.
+// Without it every confirmed message stays labelled "Sending…".
+func isPendingEvent(evt *database.Event) bool {
+	if evt == nil || evt.SendError == "" {
+		return false
+	}
+	return evt.ID == "" || strings.HasPrefix(evt.ID.String(), "~")
+}
+
 // isEditedEvent reports whether the event was actually edited. gomuks
 // initializes LastEditRowID to a non-nil zero pointer on fresh sends, so a
 // nil check alone flags brand-new messages as edited.
@@ -1999,7 +2374,11 @@ func (c *Client) storeLocalMessage(roomID string, message Message) {
 	c.local[roomID][key] = message
 	room, exists := c.rooms[roomID]
 	if exists {
-		if message.Timestamp.After(room.LastSeen) {
+		// Own optimistic sends often share the same millisecond as the previous
+		// event, so use >= here. Otherwise the sidebar preview/time advances
+		// but the text stays on the old bridge topic ("WhatsApp private chat")
+		// while the open timeline already shows the sent message.
+		if !message.Timestamp.Before(room.LastSeen) {
 			room.LastSeen = message.Timestamp
 			room.Preview = message.Body
 		}
@@ -2017,6 +2396,12 @@ func (c *Client) storeLocalMessage(roomID string, message Message) {
 func roomNeedsReply(room Room, userID, dismissedEventID string) bool {
 	if dismissedEventID != "" &&
 		(room.LastEventID == dismissedEventID || (room.LastEventID == "" && dismissedEventID == room.ID)) {
+		return false
+	}
+	// Answering the room clears it immediately. The server's unread count only
+	// drops on a later sync, so a stale Unread > 0 must not keep a room in the
+	// needs-reply view after the user has already replied.
+	if userID != "" && room.LastEventSender == userID {
 		return false
 	}
 	return room.Unread > 0 || (room.LastEventSender != "" && room.LastEventSender != userID)

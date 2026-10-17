@@ -35,9 +35,13 @@ jobs:
           retention-days: 7
 
   build:
-    name: Build macOS universal app
+    name: Build macOS universal DMGs
     runs-on: macos-latest
     needs: [prepare-assets, test]
+    env:
+      # Matches the deployment target in build/darwin/Taskfile.yml and the
+      # "macOS 12 or newer" support statement in the README.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -99,6 +103,8 @@ jobs:
           done
           lipo -create dist/gomuks-desktop-amd64 dist/gomuks-desktop-arm64 \
             -output "dist/Gomuks Desktop.app/Contents/MacOS/gomuks-desktop"
+          rm dist/gomuks-desktop-amd64 dist/gomuks-desktop-arm64
+          lipo -info "dist/Gomuks Desktop.app/Contents/MacOS/gomuks-desktop"
           cat > "dist/Gomuks Desktop.app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -111,22 +117,74 @@ jobs:
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleVersion</key><string>${GITHUB_RUN_NUMBER}</string>
+            <key>LSMinimumSystemVersion</key><string>${MACOSX_DEPLOYMENT_TARGET}</string>
+            <key>NSHighResolutionCapable</key><true/>
           </dict>
           </plist>
           EOF
           codesign --force --deep --sign - "dist/Gomuks Desktop.app"
-          ditto -c -k --keepParent "dist/Gomuks Desktop.app" dist/app-macos-universal.zip
+          codesign --verify --deep --strict "dist/Gomuks Desktop.app"
 
-      - name: Upload platform artifact
+      - name: Build universal TUI binary
+        shell: bash
+        run: |
+          for arch in amd64 arm64; do
+            clang_arch="$arch"
+            if [ "$arch" = amd64 ]; then clang_arch=x86_64; fi
+            CC="clang -arch $clang_arch" CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" go build \
+              -tags "sqlite_fts5 goolm" \
+              -ldflags "-s -w" \
+              -o "dist/gomuks-tui-${arch}" ./cmd/gomuks-tui
+          done
+          lipo -create dist/gomuks-tui-amd64 dist/gomuks-tui-arm64 \
+            -output dist/gomuks-tui
+          rm dist/gomuks-tui-amd64 dist/gomuks-tui-arm64
+          lipo -info dist/gomuks-tui
+
+      - name: Create macOS DMGs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GUI disk image: the signed app plus an /Applications symlink so the
+          # app can be dragged into place in Finder.
+          gui_stage="$(mktemp -d)"
+          cp -R "dist/Gomuks Desktop.app" "$gui_stage/"
+          ln -s /Applications "$gui_stage/Applications"
+          hdiutil create \
+            -volname "Gomuks Desktop" \
+            -srcfolder "$gui_stage" \
+            -ov -format UDZO -imagekey zlib-level=9 \
+            "dist/Gomuks-Desktop-${VERSION}-macos-universal.dmg"
+          rm -rf "$gui_stage"
+
+          # TUI disk image: the universal binary plus a symlink into
+          # /usr/local/bin so it can be dragged onto PATH in Finder.
+          tui_stage="$(mktemp -d)"
+          cp dist/gomuks-tui "$tui_stage/gomuks-tui"
+          chmod 755 "$tui_stage/gomuks-tui"
+          ln -s /usr/local/bin "$tui_stage/bin"
+          hdiutil create \
+            -volname "Gomuks TUI" \
+            -srcfolder "$tui_stage" \
+            -ov -format UDZO -imagekey zlib-level=9 \
+            "dist/Gomuks-TUI-${VERSION}-macos-universal.dmg"
+          rm -rf "$tui_stage"
+
+          hdiutil verify "dist/Gomuks-Desktop-${VERSION}-macos-universal.dmg"
+          hdiutil verify "dist/Gomuks-TUI-${VERSION}-macos-universal.dmg"
+          ls -lh dist/*.dmg
+
+      - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: app-macos-universal.zip
-          path: dist/app-macos-universal.zip
+          name: macos-dmgs
+          path: dist/*.dmg
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: macos-latest
     steps:
@@ -138,12 +196,12 @@ jobs:
 
       - name: Generate SHA-256 checksums
         working-directory: dist
-        run: shasum -a 256 app-macos-universal.zip > checksums.txt
+        run: shasum -a 256 ./*.dmg > checksums.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            dist/app-macos-universal.zip
+            dist/*.dmg
             dist/checksums.txt

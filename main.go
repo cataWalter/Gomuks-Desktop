@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"mychat/desktop"
 	"mychat/matrix"
 	"mychat/migration"
+	"mychat/tui"
 )
 
 var (
@@ -21,6 +23,15 @@ var (
 var frontendAssets embed.FS
 
 func main() {
+	// Check for TUI subcommand
+	if len(os.Args) > 1 && os.Args[1] == "tui" {
+		if err := tui.Main(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	paths, err := migration.CurrentPaths()
 	if err != nil {
 		log.Fatal(err)

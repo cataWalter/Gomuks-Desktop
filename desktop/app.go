@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"path/filepath"
 	"sync"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -13,9 +14,10 @@ import (
 )
 
 const (
-	updateEventName         = "matrix:update"
-	hostErrorEventName      = "matrix:host-error"
-	attachmentSentEventName = "matrix:attachment-sent"
+	updateEventName            = "matrix:update"
+	hostErrorEventName         = "matrix:host-error"
+	attachmentSentEventName    = "matrix:attachment-sent"
+	scheduledReminderEventName = "scheduler:reminder"
 )
 
 func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
@@ -27,9 +29,13 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	if err != nil {
 		return fmt.Errorf("open desktop preferences: %w", err)
 	}
+	scheduledJobs, err := newScheduledJobStore(filepath.Join(filepath.Dir(preferencesPath), "scheduled-jobs.json"))
+	if err != nil {
+		return fmt.Errorf("open scheduled jobs: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	service := &AppService{client: client, preferences: preferences, ctx: ctx, cancel: cancel}
+	service := &AppService{client: client, preferences: preferences, ctx: ctx, cancel: cancel, scheduled: scheduledJobs}
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
@@ -53,6 +59,9 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		OnShutdown: shutdown,
 	})
 	service.quit = app.Quit
+	service.emitReminder = func(reminder ScheduledJob) {
+		app.Event.Emit(scheduledReminderEventName, reminder)
+	}
 	service.setAutostart = func(enabled bool) error {
 		if enabled {
 			return app.Autostart.Enable()
@@ -72,7 +81,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		MinWidth:           760,
 		MinHeight:          520,
 		URL:                "/",
-		BackgroundColour:   application.NewRGB(246, 247, 244),
+		BackgroundColour:   application.NewRGB(238, 243, 239),
 		EnableFileDrop:     true,
 		UseApplicationMenu: true,
 	})
@@ -146,6 +155,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		}
 		app.Event.Emit(updateEventName, update)
 	})
+	service.startScheduledJobWorker()
 
 	if client.IsLoggedIn() {
 		service.startSync()

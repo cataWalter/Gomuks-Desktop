@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +25,10 @@ type AppService struct {
 	activeRoomMu sync.RWMutex
 	activeRoomID string
 	workers      sync.WaitGroup
+	scheduled    *scheduledJobStore
 
-	emitUpdate func(Update)
+	emitUpdate   func(Update)
+	emitReminder func(ScheduledJob)
 }
 
 type Snapshot struct {
@@ -184,7 +188,15 @@ func (s *AppService) Verify(recoveryKey string) error {
 }
 
 func (s *AppService) History(roomID string, before int64) (HistoryPage, error) {
-	page, err := s.client.HistoryPage(s.ctx, roomID, before)
+	initialLimit := 100
+	if before == 0 {
+		if configured, ok := s.preferences.All()["history.initial_messages"].(string); ok {
+			if value, parseErr := strconv.Atoi(configured); parseErr == nil {
+				initialLimit = value
+			}
+		}
+	}
+	page, err := s.client.HistoryPageWithLimit(s.ctx, roomID, before, initialLimit)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -231,12 +243,118 @@ func (s *AppService) SetTyping(roomID string, timeoutMilliseconds int64) error {
 	return s.client.SetTyping(s.ctx, roomID, time.Duration(timeoutMilliseconds)*time.Millisecond)
 }
 
-func (s *AppService) SearchMessages(roomID, query string, limit int) ([]Message, error) {
-	messages, err := s.client.SearchMessages(s.ctx, roomID, query, limit)
+type MessageSearchRequest struct {
+	Query        string `json:"query"`
+	RoomID       string `json:"roomID"`
+	Sender       string `json:"sender"`
+	MinTimestamp int64  `json:"minTimestamp"`
+	MaxTimestamp int64  `json:"maxTimestamp"`
+	Limit        int    `json:"limit"`
+	NextBatch    string `json:"nextBatch"`
+}
+
+type MessageSearchResult struct {
+	RoomID  string  `json:"roomID"`
+	Message Message `json:"message"`
+}
+
+type MessageSearchPage struct {
+	Results   []MessageSearchResult `json:"results"`
+	NextBatch string                `json:"nextBatch"`
+}
+
+func (s *AppService) SearchMessages(request MessageSearchRequest) (MessageSearchPage, error) {
+	page, err := s.client.SearchMessages(s.ctx, matrix.SearchRequest{
+		Query:        request.Query,
+		RoomID:       request.RoomID,
+		Sender:       request.Sender,
+		MinTimestamp: request.MinTimestamp,
+		MaxTimestamp: request.MaxTimestamp,
+		Limit:        request.Limit,
+		NextBatch:    request.NextBatch,
+	})
 	if err != nil {
-		return nil, err
+		return MessageSearchPage{}, err
 	}
-	return mapMessages(messages), nil
+	results := make([]MessageSearchResult, 0, len(page.Results))
+	for _, result := range page.Results {
+		mapped := mapMessages([]matrix.Message{result.Message})
+		if len(mapped) > 0 {
+			results = append(results, MessageSearchResult{RoomID: result.RoomID, Message: mapped[0]})
+		}
+	}
+	return MessageSearchPage{Results: results, NextBatch: page.NextBatch}, nil
+}
+
+func (s *AppService) ScheduleMessage(roomID, text string, dueAt int64) (ScheduledJob, error) {
+	if err := s.validateScheduledRoom(roomID); err != nil {
+		return ScheduledJob{}, err
+	}
+	return s.scheduled.scheduleMessage(roomID, text, dueAt)
+}
+
+func (s *AppService) ScheduleReply(roomID, text, replyToEventID string, dueAt int64) (ScheduledJob, error) {
+	if err := s.validateScheduledRoom(roomID); err != nil {
+		return ScheduledJob{}, err
+	}
+	return s.scheduled.scheduleReply(roomID, text, replyToEventID, dueAt)
+}
+
+func (s *AppService) ScheduleReminder(roomID, eventID, text string, dueAt int64) (ScheduledJob, error) {
+	if err := s.validateScheduledRoom(roomID); err != nil {
+		return ScheduledJob{}, err
+	}
+	return s.scheduled.scheduleReminder(roomID, eventID, text, dueAt)
+}
+
+func (s *AppService) ScheduledJobs() []ScheduledJob {
+	if s.scheduled == nil {
+		return []ScheduledJob{}
+	}
+	return s.scheduled.list()
+}
+
+func (s *AppService) UpdateScheduledJob(id string, dueAt int64) error {
+	if s.scheduled == nil {
+		return errors.New("scheduled jobs are unavailable")
+	}
+	return s.scheduled.update(id, dueAt)
+}
+
+func (s *AppService) CancelScheduledJob(id string) error {
+	if s.scheduled == nil {
+		return errors.New("scheduled jobs are unavailable")
+	}
+	return s.scheduled.cancel(id)
+}
+
+func (s *AppService) RetryScheduledMessage(id string) error {
+	if s.scheduled == nil {
+		return errors.New("scheduled jobs are unavailable")
+	}
+	return s.scheduled.retryMessage(id, time.Now().UnixMilli())
+}
+
+func (s *AppService) DismissScheduledJob(id string) error {
+	if s.scheduled == nil {
+		return errors.New("scheduled jobs are unavailable")
+	}
+	return s.scheduled.dismiss(id)
+}
+
+func (s *AppService) validateScheduledRoom(roomID string) error {
+	if s.scheduled == nil {
+		return errors.New("scheduled jobs are unavailable")
+	}
+	if roomID == "" {
+		return errors.New("select a room first")
+	}
+	for _, room := range s.client.Rooms() {
+		if room.ID == roomID {
+			return nil
+		}
+	}
+	return errors.New("scheduled job room was not found")
 }
 
 func (s *AppService) RoomMembers(roomID string) ([]Member, error) {
@@ -461,6 +579,68 @@ func (s *AppService) startSync() {
 			s.emitUpdate(Update{Error: err.Error(), ConnectionState: string(matrix.StateOffline)})
 		}
 	}()
+}
+
+func (s *AppService) startScheduledJobWorker() {
+	if s.scheduled == nil || s.client == nil {
+		return
+	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		s.processDueScheduledJobs()
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-ticker.C:
+				s.processDueScheduledJobs()
+			}
+		}
+	}()
+}
+
+type scheduledMessageSender interface {
+	SendMessage(context.Context, string, string) error
+	SendReply(context.Context, string, string, string) error
+}
+
+func dispatchScheduledMessage(ctx context.Context, sender scheduledMessageSender, job ScheduledJob) error {
+	if job.ReplyToEventID != "" {
+		return sender.SendReply(ctx, job.RoomID, job.Text, job.ReplyToEventID)
+	}
+	return sender.SendMessage(ctx, job.RoomID, job.Text)
+}
+
+func (s *AppService) processDueScheduledJobs() {
+	if s.scheduled == nil || s.ctx.Err() != nil {
+		return
+	}
+	if s.client.IsLoggedIn() && s.client.ConnectionState() == matrix.StateConnected {
+		jobs, err := s.scheduled.claimDue(scheduledMessageKind, time.Now().UnixMilli())
+		if err != nil {
+			log.Printf("claim scheduled messages: %v", err)
+		}
+		for _, job := range jobs {
+			startedAt := time.Now().UnixMilli()
+			sendErr := dispatchScheduledMessage(s.ctx, s.client, job)
+			if finishErr := s.scheduled.finishMessage(job.ID, sendErr, startedAt); finishErr != nil {
+				log.Printf("finish scheduled message %s: %v", job.ID, finishErr)
+			}
+		}
+	}
+	reminders, err := s.scheduled.claimDue(scheduledReminderKind, time.Now().UnixMilli())
+	if err != nil {
+		log.Printf("claim scheduled reminders: %v", err)
+		return
+	}
+	for _, reminder := range reminders {
+		if s.emitReminder != nil {
+			s.emitReminder(reminder)
+		}
+	}
 }
 
 func (s *AppService) close() {

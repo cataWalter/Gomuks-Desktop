@@ -139,7 +139,7 @@ func validatePreference(key string, value any) error {
 			return fmt.Errorf("preference %q must be a boolean", key)
 		}
 	case "appearance.theme":
-		if !oneOf(value, "System default", "Light", "Dark", "OLED black") {
+		if !oneOf(value, "System default", "Light", "Dark", "OLED black", "Bosco", "Rosa") {
 			return errors.New("appearance.theme has an unsupported value")
 		}
 	case "appearance.font_size":
@@ -158,6 +158,10 @@ func validatePreference(key string, value any) error {
 		shortcut, ok := value.(string)
 		if !ok || len([]rune(shortcut)) != 1 {
 			return errors.New("shortcuts.mark_answered must contain one character")
+		}
+	case "history.initial_messages":
+		if !oneOf(value, "25", "50", "100", "250", "500", "1000") {
+			return errors.New("history.initial_messages has an unsupported value")
 		}
 	default:
 		return fmt.Errorf("unknown preference %q", key)

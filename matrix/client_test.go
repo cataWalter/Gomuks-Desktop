@@ -13,6 +13,7 @@ import (
 	"go.mau.fi/gomuks/pkg/hicli/database"
 	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
 	"go.mau.fi/util/jsontime"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
@@ -39,6 +40,64 @@ func TestMessageFromEvent(t *testing.T) {
 	}
 	if message.FormattedBody != "<strong>hello</strong>" {
 		t.Fatalf("formatted body = %q", message.FormattedBody)
+	}
+}
+
+func TestTimelineMessagePrefixCountsVisibleMessages(t *testing.T) {
+	events := []*database.Event{
+		{Type: event.EventReaction.Type, RedactedBy: "$redaction"},
+		{ID: "$first", Type: event.EventMessage.Type, Content: json.RawMessage(`{"body":"first"}`)},
+		{ID: "$second", Type: event.EventMessage.Type, Content: json.RawMessage(`{"body":"second"}`)},
+	}
+
+	prefix, count := timelineMessagePrefix(events, 1)
+	if prefix != 2 || count != 1 {
+		t.Fatalf("timeline prefix = %d with %d messages, want 2 with 1 message", prefix, count)
+	}
+}
+
+func TestHasServerHistory(t *testing.T) {
+	tests := []struct {
+		name string
+		room *database.Room
+		want bool
+	}{
+		{name: "missing room"},
+		{name: "no pagination token", room: &database.Room{}},
+		{name: "pagination complete", room: &database.Room{PrevBatch: database.PrevBatchPaginationComplete}},
+		{name: "server history available", room: &database.Room{PrevBatch: "opaque-next-page-token"}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasServerHistory(test.room); got != test.want {
+				t.Fatalf("hasServerHistory() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHistoryPageReportsServerBackfill(t *testing.T) {
+	client, err := New(filepath.Join(t.TempDir(), "profile", "matrix.db"))
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	roomID := id.RoomID("!history:example.org")
+	if err = client.engine.DB.Room.CreateRow(ctx, roomID); err != nil {
+		t.Fatalf("create room row: %v", err)
+	}
+	if err = client.engine.DB.Room.SetPrevBatch(ctx, roomID, "opaque-next-page-token"); err != nil {
+		t.Fatalf("set room pagination token: %v", err)
+	}
+
+	page, err := client.HistoryPageWithLimit(ctx, roomID.String(), 0, 25)
+	if err != nil {
+		t.Fatalf("load initial history page: %v", err)
+	}
+	if !page.HasMore {
+		t.Fatal("initial history page should expose server-side older messages")
 	}
 }
 
@@ -182,6 +241,10 @@ func TestMessageFromEventIgnoresNonMessages(t *testing.T) {
 			evt:  &database.Event{Type: event.StateTopic.Type, StateKey: stringPointer("")},
 		},
 		{
+			name: "redacted reaction",
+			evt:  &database.Event{Type: event.EventReaction.Type, RedactedBy: "$redaction"},
+		},
+		{
 			name: "message without body",
 			evt:  &database.Event{Type: event.EventMessage.Type, Content: json.RawMessage(`{"msgtype":"m.text"}`)},
 		},
@@ -216,8 +279,12 @@ func TestRoomNeedsReplyHonorsUnreadIncomingAndDismissedEvents(t *testing.T) {
 		t.Fatal("outgoing event with no unread messages should not need a reply")
 	}
 	room.Unread = 1
+	if roomNeedsReply(room, "@me:example.org", "") {
+		t.Fatal("replying should clear needs-reply even while the stale unread count remains")
+	}
+	room.LastEventSender = "@alice:example.org"
 	if !roomNeedsReply(room, "@me:example.org", "") {
-		t.Fatal("unread messages should put the room in needs-reply")
+		t.Fatal("unread messages from someone else should put the room in needs-reply")
 	}
 	room = Room{ID: "!cached:example.org", Unread: 2}
 	if roomNeedsReply(room, "@me:example.org", room.ID) {
@@ -243,6 +310,158 @@ func TestPublishCoalescesTimelineChangedRoomIDs(t *testing.T) {
 	}
 	if len(update.ChangedRoomID) != 0 {
 		t.Fatalf("metadata changed rooms = %v, want none", update.ChangedRoomID)
+	}
+}
+
+func TestApplySyncKeepsPreviewAndTimelineInSync(t *testing.T) {
+	client := &Client{
+		events: make(chan Update, 1),
+		done:   make(chan struct{}),
+		rooms:  map[string]Room{},
+	}
+	roomID := id.RoomID("!chat:example.org")
+	latest := time.Date(2026, time.October, 17, 11, 57, 0, 0, time.UTC)
+	stale := latest.Add(-time.Minute)
+	client.rooms[roomID.String()] = Room{ID: roomID.String(), Name: "Andrea", Preview: "older", LastSeen: stale}
+	syncEvent := &jsoncmd.SyncComplete{
+		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+			roomID: {
+				Timeline: []database.TimelineRowTuple{{Timeline: 2, Event: 2}},
+				Events: []*database.Event{
+					{
+						RowID:     2,
+						Type:      event.EventMessage.Type,
+						Content:   json.RawMessage(`{"body":"se hai bisogno dimmi"}`),
+						Timestamp: jsontime.UM(latest),
+					},
+				},
+			},
+		},
+	}
+	client.applySync(syncEvent, true)
+	rooms := client.Rooms()
+	if len(rooms) != 1 || rooms[0].Preview != "se hai bisogno dimmi" || !rooms[0].LastSeen.Equal(latest) {
+		t.Fatalf("preview not synced with timeline: %+v", rooms)
+	}
+	update := <-client.Events()
+	if len(update.TimelineChangedRoomID) != 1 || update.TimelineChangedRoomID[0] != roomID.String() {
+		t.Fatalf("timeline changed rooms = %v, want open chat refresh", update.TimelineChangedRoomID)
+	}
+	// Non-timeline events must not move the preview or trigger a refresh.
+	client.applySync(&jsoncmd.SyncComplete{
+		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+			roomID: {
+				Events: []*database.Event{
+					{
+						RowID:     99,
+						Type:      event.EventMessage.Type,
+						Content:   json.RawMessage(`{\"body\":\"background noise\"}`),
+						Timestamp: jsontime.UM(latest.Add(time.Minute)),
+					},
+				},
+			},
+		},
+	}, true)
+	rooms = client.Rooms()
+	if len(rooms) != 1 || rooms[0].Preview != "se hai bisogno dimmi" {
+		t.Fatalf("non-timeline event moved preview: %+v", rooms)
+	}
+	update = <-client.Events()
+	if len(update.TimelineChangedRoomID) != 0 {
+		t.Fatalf("timeline changed rooms = %v, want no refresh", update.TimelineChangedRoomID)
+	}
+}
+
+// gomuks picks a room's preview event server-side (room.preview_event_rowid).
+// When that event's body arrives in this payload the sidebar must use it:
+// re-deriving the preview from the newest in-timeline event can surface the
+// bridge placeholder text instead of the message the open chat shows.
+func TestApplySyncPrefersAuthoritativePreviewEvent(t *testing.T) {
+	client := &Client{
+		events: make(chan Update, 1),
+		done:   make(chan struct{}),
+		rooms:  map[string]Room{},
+	}
+	roomID := id.RoomID("!bridge:example.org")
+	displayName := "WhatsApp chat"
+	topic := "WhatsApp private chat"
+	sent := time.Date(2026, time.October, 17, 12, 59, 0, 0, time.UTC)
+	client.rooms[roomID.String()] = Room{
+		ID: roomID.String(), Name: displayName, Topic: topic,
+		LastSeen: sent.Add(-time.Minute),
+	}
+	client.applySync(&jsoncmd.SyncComplete{
+		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+			roomID: {
+				Meta: &database.Room{
+					ID:                roomID,
+					Name:              &displayName,
+					Topic:             &topic,
+					PreviewEventRowID: 5,
+					SortingTimestamp:  jsontime.UM(sent),
+				},
+				Timeline: []database.TimelineRowTuple{{Timeline: 1, Event: 9}},
+				Events: []*database.Event{
+					{
+						RowID:     9,
+						Type:      event.EventMessage.Type,
+						Content:   json.RawMessage(`{"body":"WhatsApp private chat"}`),
+						Timestamp: jsontime.UM(sent),
+					},
+					{
+						RowID:     5,
+						Type:      event.EventMessage.Type,
+						Content:   json.RawMessage(`{"body":"i want a yes"}`),
+						Timestamp: jsontime.UM(sent),
+					},
+				},
+			},
+		},
+	}, false)
+	rooms := client.Rooms()
+	if len(rooms) != 1 || rooms[0].Preview != "i want a yes" {
+		t.Fatalf("authoritative preview not used: %+v", rooms)
+	}
+}
+
+// A freshly sent own message can arrive in `events` before it has a timeline
+// row (the timeline insert may land a sync later). It must still seed an
+// otherwise-empty preview, otherwise the sidebar falls back to the room topic
+// while the open chat already shows the sent text.
+func TestApplySyncSeedsEmptyPreviewFromOwnPendingSend(t *testing.T) {
+	client := &Client{
+		events: make(chan Update, 1),
+		done:   make(chan struct{}),
+		rooms:  map[string]Room{},
+	}
+	roomID := id.RoomID("!bridge:example.org")
+	topic := "WhatsApp private chat"
+	sent := time.Date(2026, time.October, 17, 12, 59, 0, 0, time.UTC)
+	client.rooms[roomID.String()] = Room{
+		ID: roomID.String(), Name: "WhatsApp chat", Topic: topic,
+		LastSeen: sent.Add(-time.Minute),
+	}
+	client.applySync(&jsoncmd.SyncComplete{
+		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+			roomID: {
+				// No timeline rows: the send has not been persisted yet.
+				Events: []*database.Event{
+					{
+						RowID:     7,
+						Type:      event.EventMessage.Type,
+						Content:   json.RawMessage(`{"body":"i want a yes"}`),
+						Timestamp: jsontime.UM(sent),
+					},
+				},
+			},
+		},
+	}, false)
+	rooms := client.Rooms()
+	if len(rooms) != 1 || rooms[0].Preview != "i want a yes" {
+		t.Fatalf("pending own send did not seed preview: %+v", rooms)
+	}
+	if !rooms[0].LastSeen.Equal(sent) {
+		t.Fatalf("last seen = %v, want %v", rooms[0].LastSeen, sent)
 	}
 }
 
@@ -294,9 +513,11 @@ func TestApplySyncUpdatesRoomsAndRemovesLeftRooms(t *testing.T) {
 	syncEvent := &jsoncmd.SyncComplete{
 		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
 			roomID: {
-				Meta: room,
+				Meta:     room,
+				Timeline: []database.TimelineRowTuple{{Timeline: 7, Event: 7}},
 				Events: []*database.Event{
 					{
+						RowID:     7,
 						Type:      event.EventMessage.Type,
 						Content:   json.RawMessage(`{"body":"latest"}`),
 						Timestamp: jsontime.UM(latest),
@@ -326,6 +547,97 @@ func TestApplySyncUpdatesRoomsAndRemovesLeftRooms(t *testing.T) {
 	update := <-client.Events()
 	if len(update.ChangedRoomID) != 2 {
 		t.Fatalf("changed rooms = %v, want update and removal", update.ChangedRoomID)
+	}
+}
+
+func TestApplySyncUsesDirectRoomMemberAvatar(t *testing.T) {
+	client, err := New(filepath.Join(t.TempDir(), "profile", "matrix.db"))
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	roomID := id.RoomID("!dm:example.org")
+	userID := id.UserID("@alice:example.org")
+	avatar := id.ContentURIString("mxc://example.org/alice-avatar")
+	stateKey := userID.String()
+	if err = client.engine.DB.Room.CreateRow(ctx, roomID); err != nil {
+		t.Fatalf("create room row: %v", err)
+	}
+	memberEvent := &database.Event{
+		RoomID:    roomID,
+		ID:        id.EventID("$alice-member"),
+		Sender:    userID,
+		Type:      event.StateMember.Type,
+		StateKey:  &stateKey,
+		Timestamp: jsontime.UM(time.Now()),
+		Content:   json.RawMessage(`{"displayname":"Alice","avatar_url":"` + string(avatar) + `"}`),
+		Unsigned:  json.RawMessage(`{}`),
+	}
+	rowID, err := client.engine.DB.Event.Insert(ctx, memberEvent)
+	if err != nil {
+		t.Fatalf("insert member state: %v", err)
+	}
+	if err = client.engine.DB.CurrentState.Set(ctx, roomID, event.StateMember, userID.String(), rowID, ""); err != nil {
+		t.Fatalf("set current member state: %v", err)
+	}
+
+	displayName := "Alice"
+	client.applySync(&jsoncmd.SyncComplete{
+		Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+			roomID: {Meta: &database.Room{ID: roomID, Name: &displayName, DMUserID: &userID}},
+		},
+	}, false)
+
+	rooms := client.Rooms()
+	if len(rooms) != 1 || rooms[0].Avatar != string(avatar) {
+		t.Fatalf("direct room avatar = %+v, want %q", rooms, avatar)
+	}
+}
+
+func TestApplySyncClassifiesUnmarkedDirectRoomsByMemberCount(t *testing.T) {
+	tests := []struct {
+		name       string
+		joined     int
+		invited    int
+		wantDirect bool
+	}{
+		{name: "two joined members", joined: 2, wantDirect: true},
+		{name: "joined and invited members", joined: 1, invited: 1, wantDirect: true},
+		{name: "three joined members", joined: 3, wantDirect: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			roomID := id.RoomID("!" + strings.ReplaceAll(test.name, " ", "-") + ":example.org")
+			joined, invited := test.joined, test.invited
+			client := &Client{rooms: make(map[string]Room)}
+			client.applySync(&jsoncmd.SyncComplete{
+				Rooms: map[id.RoomID]*jsoncmd.SyncRoom{
+					roomID: {Meta: &database.Room{
+						ID: roomID,
+						LazyLoadSummary: &mautrix.LazyLoadSummary{
+							JoinedMemberCount:  &joined,
+							InvitedMemberCount: &invited,
+						},
+					}},
+				},
+			}, false)
+
+			rooms := client.Rooms()
+			if len(rooms) != 1 || rooms[0].Direct != test.wantDirect {
+				t.Fatalf("direct = %v, want %v; rooms = %+v", len(rooms) == 1 && rooms[0].Direct, test.wantDirect, rooms)
+			}
+		})
+	}
+}
+
+func TestMissingMatrixMediaErrorIsRecognized(t *testing.T) {
+	if !isMissingMatrixMediaError(fmt.Errorf("download Matrix media: %w", mautrix.MNotFound)) {
+		t.Fatal("wrapped M_NOT_FOUND error was not recognized")
+	}
+	if isMissingMatrixMediaError(fmt.Errorf("media server unavailable")) {
+		t.Fatal("non-404 error was treated as missing media")
 	}
 }
 
@@ -454,6 +766,45 @@ func TestWaitForCacheWaitsUntilRestoreCompletes(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WaitForCache did not return after restore completed")
+	}
+}
+
+func TestLocalSearchParamsSupportsGlobalFiltersAndPagination(t *testing.T) {
+	minTimestamp := time.Date(2026, time.October, 1, 0, 0, 0, 0, time.UTC)
+	maxTimestamp := time.Date(2026, time.October, 17, 23, 59, 59, 999000000, time.UTC)
+	request := SearchRequest{
+		Query:        "  project update  ",
+		RoomID:       "!room:example.org",
+		Sender:       "@alice:example.org",
+		MinTimestamp: minTimestamp.UnixMilli(),
+		MaxTimestamp: maxTimestamp.UnixMilli(),
+		Limit:        25,
+		NextBatch:    "local_offset:25",
+	}
+
+	params, err := localSearchParams(request)
+	if err != nil {
+		t.Fatalf("build search params: %v", err)
+	}
+	if params.SearchTerm != "project update" || !params.SortByTime || params.Limit != 25 || params.NextBatch != request.NextBatch {
+		t.Fatalf("unexpected search params: %+v", params)
+	}
+	if len(params.RoomIDs) != 1 || params.RoomIDs[0] != id.RoomID(request.RoomID) {
+		t.Fatalf("room filter = %v, want %q", params.RoomIDs, request.RoomID)
+	}
+	if len(params.Senders) != 1 || params.Senders[0] != id.UserID(request.Sender) {
+		t.Fatalf("sender filter = %v, want %q", params.Senders, request.Sender)
+	}
+	if params.MinTimestamp.UnixMilli() != request.MinTimestamp || params.MaxTimestamp.UnixMilli() != request.MaxTimestamp {
+		t.Fatalf("timestamp filters = (%d, %d), want (%d, %d)", params.MinTimestamp.UnixMilli(), params.MaxTimestamp.UnixMilli(), request.MinTimestamp, request.MaxTimestamp)
+	}
+
+	globalParams, err := localSearchParams(SearchRequest{Query: "topic"})
+	if err != nil {
+		t.Fatalf("build global search params: %v", err)
+	}
+	if len(globalParams.RoomIDs) != 0 || globalParams.Limit != 50 {
+		t.Fatalf("global search params = %+v, want no room filter and default limit 50", globalParams)
 	}
 }
 
@@ -617,6 +968,45 @@ func TestMessageFromEventKeepsRealSendErrors(t *testing.T) {
 	}
 	if message.SendError != "failed to encrypt: boom" {
 		t.Fatalf("SendError = %q, want the real failure", message.SendError)
+	}
+}
+
+func TestMessageFromEventClearsSendingForConfirmedEvent(t *testing.T) {
+	// gomuks leaves the "not sent" marker on the row even after a successful
+	// send (its deferred cleanup re-writes it once UpdateID has cleared it), so
+	// a real event ID must win over send_error and drop the pending state.
+	evt := &database.Event{
+		ID:        id.EventID("$confirmed:example.org"),
+		Sender:    id.UserID("@me:example.org"),
+		Type:      event.EventMessage.Type,
+		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hi"}`),
+		SendError: "not sent",
+	}
+	message, ok := messageFromEvent(evt)
+	if !ok {
+		t.Fatal("expected confirmed message to be represented")
+	}
+	if message.Sending {
+		t.Fatalf("Sending = true for a confirmed event, want false: %+v", message)
+	}
+	if message.SendError != "" {
+		t.Fatalf("SendError = %q, want empty for a confirmed event", message.SendError)
+	}
+}
+
+func TestMessageFromEventKeepsUnplacedEventPending(t *testing.T) {
+	evt := &database.Event{
+		Sender:    id.UserID("@me:example.org"),
+		Type:      event.EventMessage.Type,
+		Content:   json.RawMessage(`{"msgtype":"m.text","body":"hi"}`),
+		SendError: "not sent",
+	}
+	message, ok := messageFromEvent(evt)
+	if !ok {
+		t.Fatal("expected unplaced message to be represented")
+	}
+	if !message.Sending {
+		t.Fatalf("Sending = false for an event without an ID, want true: %+v", message)
 	}
 }
 

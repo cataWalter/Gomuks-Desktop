@@ -33,6 +33,12 @@ The Go command stays attached to the terminal while the app is running. Quit
 with `Cmd+Q` or stop it with `Ctrl+C`. On later launches, run only the Go
 command; rebuild the frontend first whenever its source or dependencies change.
 
+The terminal interface can be started without building the frontend:
+
+```sh
+go run -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
+```
+
 For live development with the Wails frontend and Go hot-reload workflow, install
 the Wails CLI version matching `go.mod` if needed, then run:
 
@@ -75,23 +81,34 @@ or quit; its icon reflects unread activity. Closing the window can minimize the
 app to the tray, and the startup preference registers the app with the host OS.
 Clicking a notification focuses the app and opens the relevant room.
 
-Pushing a `v*` tag runs the standalone release workflow. It builds a universal
-macOS app bundle, then attaches the archive and a SHA-256 checksum file to the
-GitHub Release.
+Pushing a `v*` tag runs the standalone release workflow. It builds universal
+macOS binaries for the desktop app and the terminal interface, packages each
+into a DMG with an ad-hoc signature, then attaches both disk images and a
+SHA-256 checksum file to the GitHub Release.
 
 Build the frontend before compiling the Go app. The focused backend checks do not
 launch a desktop window:
 
 ```sh
 npm --prefix frontend ci
+npm --prefix frontend test
 npm --prefix frontend run build
-go test -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration
-go vet -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration
+go test -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration ./tui
+go vet -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration ./tui
 go build -tags "sqlite_fts5 goolm" .
+go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 ```
 
 Tagged versions (`v*`) trigger the GitHub Actions release workflow. It builds
-a universal macOS app archive on `macos-latest`, then publishes it with a
-`checksums.txt` SHA-256 manifest. Release builds
-embed the version, commit, and build timestamp; builds outside the release
-workflow report `dev` as their version.
+universal (arm64 + amd64) macOS binaries on `macos-latest` for both the desktop
+app and the standalone TUI, packages them as
+`Gomuks-Desktop-<version>-macos-universal.dmg` and
+`Gomuks-TUI-<version>-macos-universal.dmg`, and publishes them with a
+`checksums.txt` SHA-256 manifest. The desktop disk image contains the signed
+app plus an `/Applications` symlink; the TUI disk image contains the
+`gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Desktop release
+builds embed the version, commit, and build timestamp; builds outside the
+release workflow report `dev` as their version.
+
+Manually dispatching the workflow builds and uploads the DMGs as workflow
+artifacts. Only a version-tag run publishes a GitHub Release.

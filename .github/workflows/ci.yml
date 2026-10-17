@@ -33,13 +33,16 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
+          npm run test
           npm run build
 
       - name: Test
-        run: go test -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration
+        run: go test -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration ./tui
 
       - name: Vet
-        run: go vet -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration
+        run: go vet -tags "sqlite_fts5 goolm" ./desktop ./matrix ./migration ./tui
 
       - name: Build
-        run: go build -tags "sqlite_fts5 goolm" .
+        run: |
+          go build -tags "sqlite_fts5 goolm" .
+          go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
