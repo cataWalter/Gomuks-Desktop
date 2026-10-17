@@ -188,10 +188,92 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-windows:
+    name: Build Windows x64 ZIPs
+    runs-on: windows-latest
+    needs: [test]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Generate Wails bindings
+        shell: pwsh
+        run: |
+          $env:GOBIN = Join-Path $env:RUNNER_TEMP "wails-bin"
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30
+          & (Join-Path $env:GOBIN "wails3.exe") generate bindings -f "-tags sqlite_fts5,goolm" -clean=true -ts -i
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Prepare build metadata
+        shell: pwsh
+        run: |
+          $buildDate = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+          "VERSION=$env:GITHUB_REF_NAME" >> $env:GITHUB_ENV
+          "BUILD_DATE=$buildDate" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force dist | Out-Null
+
+      - name: Generate Windows application resources
+        shell: pwsh
+        run: |
+          & (Join-Path $env:RUNNER_TEMP "wails-bin\wails3.exe") generate syso `
+            -arch amd64 `
+            -icon build/windows/icon.ico `
+            -manifest build/windows/pinger.exe.manifest `
+            -out rsrc_windows_amd64.syso
+
+      - name: Build Windows x64 binaries
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+          GOARCH: amd64
+          GOOS: windows
+          CC: gcc
+        run: |
+          $ldflags = "-s -w -H windowsgui -X main.Version=$env:VERSION -X main.Commit=$env:GITHUB_SHA -X main.BuildDate=$env:BUILD_DATE"
+          go build -tags "sqlite_fts5 goolm" -trimpath -buildvcs=false "-ldflags=$ldflags" -o dist/pinger.exe .
+          Remove-Item rsrc_windows_amd64.syso
+          go build -tags "sqlite_fts5 goolm" -trimpath -buildvcs=false "-ldflags=-s -w" -o dist/gomuks-tui.exe ./cmd/gomuks-tui
+          Compress-Archive -LiteralPath dist/pinger.exe -DestinationPath "dist/Pinger-$($env:VERSION)-windows-amd64.zip"
+          Compress-Archive -LiteralPath dist/gomuks-tui.exe -DestinationPath "dist/Pinger-TUI-$($env:VERSION)-windows-amd64.zip"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zips
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, build-windows]
     runs-on: macos-latest
     steps:
       - name: Download platform artifacts
@@ -202,7 +284,7 @@ jobs:
 
       - name: Generate SHA-256 checksums
         working-directory: dist
-        run: shasum -a 256 ./*.dmg > checksums.txt
+        run: shasum -a 256 ./*.dmg ./*.zip > checksums.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
@@ -210,4 +292,5 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.dmg
+            dist/*.zip
             dist/checksums.txt

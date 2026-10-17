@@ -15,10 +15,11 @@ application that embeds it.
 
 ## Run locally
 
-The desktop app targets macOS 12 or newer and requires Go 1.26 or newer, Node.js
-22 or newer with npm, and the Xcode Command Line Tools. The `sqlite_fts5` build
-tag is required. The `goolm` tag selects mautrix-go's pure-Go Olm implementation,
-so libolm does not need to be installed.
+The desktop app targets macOS 12 or newer and Windows x64 with the WebView2
+Runtime. Building requires Go 1.26 or newer, Node.js 22 or newer with npm, and
+the Xcode Command Line Tools for macOS builds. The `sqlite_fts5` build tag is
+required. The `goolm` tag selects mautrix-go's pure-Go Olm implementation, so
+libolm does not need to be installed.
 
 From the repository root, install the frontend dependencies, build the frontend,
 and launch the desktop app:
@@ -82,9 +83,9 @@ app to the tray, and the startup preference registers the app with the host OS.
 Clicking a notification focuses the app and opens the relevant room.
 
 Pushing a `v*` tag runs the standalone release workflow. It builds universal
-macOS binaries for the desktop app and the terminal interface, packages each
-into a DMG with an ad-hoc signature, then attaches both disk images and a
-SHA-256 checksum file to the GitHub Release.
+macOS binaries for the desktop app and terminal interface, plus Windows x64
+binaries for both, and attaches the packages and SHA-256 checksums to the
+GitHub Release.
 
 Build the frontend before compiling the Go app. The focused backend checks do not
 launch a desktop window:
@@ -100,15 +101,19 @@ go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 ```
 
 Tagged versions (`v*`) trigger the GitHub Actions release workflow. It builds
-universal (arm64 + amd64) macOS binaries on `macos-latest` for both the desktop
-app and the standalone TUI, packages them as
+universal (arm64 + amd64) macOS binaries on `macos-latest` and x64 Windows
+binaries on `windows-latest` for both the desktop app and standalone TUI. The
+macOS binaries are packaged as
 `Pinger-<version>-macos-universal.dmg` and
-`Pinger-TUI-<version>-macos-universal.dmg`, and publishes them with a
-`checksums.txt` SHA-256 manifest. The desktop disk image contains the signed
-app plus an `/Applications` symlink; the TUI disk image contains the
-`gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Pinger release
-builds embed the version, commit, and build timestamp; builds outside the
-release workflow report `dev` as their version.
+`Pinger-TUI-<version>-macos-universal.dmg`; Windows packages are
+`Pinger-<version>-windows-amd64.zip` and
+`Pinger-TUI-<version>-windows-amd64.zip`. Releases include a `checksums.txt`
+SHA-256 manifest. The desktop disk image contains the signed app plus an
+`/Applications` symlink; the TUI disk image contains the `gomuks-tui` binary
+plus a `bin` symlink to `/usr/local/bin`. Windows ZIPs contain `pinger.exe` or
+`gomuks-tui.exe`; the desktop executable embeds its icon and manifest. Pinger
+desktop release builds embed the version, commit, and build timestamp; builds
+outside the release workflow report `dev` as their version.
 
-Manually dispatching the workflow builds and uploads the DMGs as workflow
-artifacts. Only a version-tag run publishes a GitHub Release.
+Manually dispatching the workflow builds and uploads the DMGs and ZIPs as
+workflow artifacts. Only a version-tag run publishes a GitHub Release.
