@@ -21,6 +21,8 @@
             <string>12.0.0</string>
         <key>NSHighResolutionCapable</key>
             <string>true</string>
+        <key>NSMicrophoneUsageDescription</key>
+            <string>Pinger uses the microphone to record voice messages.</string>
         <key>NSHumanReadableCopyright</key>
             <string>© 2026, Pinger</string>
     </dict>

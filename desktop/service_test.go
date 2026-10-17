@@ -110,7 +110,7 @@ func TestReadDroppedAttachmentRejectsDirectories(t *testing.T) {
 
 func TestSendAttachmentRejectsOversizedData(t *testing.T) {
 	service := &AppService{}
-	err := service.SendAttachment("!room:example.org", "large.bin", make([]byte, maxAttachmentSize+1))
+	err := service.SendAttachment("!room:example.org", "large.bin", make([]byte, maxAttachmentSize+1), false, 0)
 	if err == nil || !strings.Contains(err.Error(), "50 MiB") {
 		t.Fatalf("error = %v, want 50 MiB limit error", err)
 	}

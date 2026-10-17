@@ -191,6 +191,56 @@ func TestReplyAndEditUseSelectedTimelineMessage(t *testing.T) {
 	}
 }
 
+func TestAudioDevicePickerSelectsInput(t *testing.T) {
+	model := *NewModel(nil)
+	model.loginActive = false
+	model.audioDevicePickerOpen = true
+	model.audioInputDevices = []audioInputDevice{{id: "a1b2", name: "Desk microphone"}}
+
+	if !strings.Contains(model.View(), "Desk microphone") {
+		t.Fatal("microphone picker does not show enumerated devices")
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model = updated.(Model)
+	if model.audioDevicePickerIndex != 1 {
+		t.Fatalf("selected option = %d, want device option 1", model.audioDevicePickerIndex)
+	}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.voiceInputDeviceID != "a1b2" || model.audioDevicePickerOpen {
+		t.Fatalf("selected device = %q, picker open = %t", model.voiceInputDeviceID, model.audioDevicePickerOpen)
+	}
+}
+
+func TestAudioDevicePickerSelectsSystemDefault(t *testing.T) {
+	model := *NewModel(nil)
+	model.loginActive = false
+	model.voiceInputDeviceID = "a1b2"
+	model.audioDevicePickerOpen = true
+	model.audioInputDevices = []audioInputDevice{{id: "a1b2", name: "Desk microphone"}}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = updated.(Model)
+	if model.voiceInputDeviceID != "" || model.audioDevicePickerOpen {
+		t.Fatalf("selected device = %q, picker open = %t; want system default and closed picker", model.voiceInputDeviceID, model.audioDevicePickerOpen)
+	}
+}
+
+func TestAudioDevicePickerCancelKeepsSelection(t *testing.T) {
+	model := *NewModel(nil)
+	model.loginActive = false
+	model.voiceInputDeviceID = "a1b2"
+	model.audioDevicePickerOpen = true
+	model.audioInputDevices = []audioInputDevice{{id: "a1b2", name: "Desk microphone"}, {id: "c3d4", name: "USB microphone"}}
+	model.audioDevicePickerIndex = 2
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = updated.(Model)
+	if model.voiceInputDeviceID != "a1b2" || model.audioDevicePickerOpen {
+		t.Fatalf("selected device = %q, picker open = %t; want previous selection and closed picker", model.voiceInputDeviceID, model.audioDevicePickerOpen)
+	}
+}
+
 func TestLoginSubmissionMasksPassword(t *testing.T) {
 	login := newLoginModel()
 	login.homeserver.SetValue("https://matrix.example")

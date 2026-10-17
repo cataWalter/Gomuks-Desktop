@@ -22,7 +22,7 @@ const (
 	notificationOpenRoomName   = "notification:open-room"
 )
 
-func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
+func Run(client *matrix.Client, assets fs.FS, dataDir, preferencesPath, mediaCacheDir string) error {
 	frontend, err := fs.Sub(assets, "frontend/dist")
 	if err != nil {
 		return fmt.Errorf("open embedded frontend assets: %w", err)
@@ -39,11 +39,16 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	notifier := notifications.New()
 	service := &AppService{client: client, preferences: preferences, notifier: notifier, ctx: ctx, cancel: cancel, scheduled: scheduledJobs}
+	if err = service.initializeAccounts(dataDir, mediaCacheDir); err != nil {
+		cancel()
+		client.Close()
+		return fmt.Errorf("initialize Matrix accounts: %w", err)
+	}
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
 			service.close()
-			client.Close()
+			service.closeAccountClients()
 			if lifecycle, ok := notifier.(notifications.Lifecycle); ok {
 				if closeErr := lifecycle.Close(); closeErr != nil {
 					log.Printf("stop native notifications: %v", closeErr)
@@ -86,6 +91,12 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		log.Printf("apply launch at startup preference: %v", err)
 	}
 
+	// The menu-bar icon is the only way to reopen a hidden window, so hiding to tray and starting minimized require it.
+	menuBarIconEnabled := func() bool {
+		value, ok := preferences.All()["window.menu_bar_icon"].(bool)
+		return !ok || value
+	}
+	startMinimized, _ := preferences.All()["window.start_minimized"].(bool)
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:               "main",
 		Title:              "Pinger",
@@ -97,6 +108,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		BackgroundColour:   application.NewRGB(238, 243, 239),
 		EnableFileDrop:     true,
 		UseApplicationMenu: true,
+		Hidden:             startMinimized && menuBarIconEnabled(),
 	})
 
 	normalIcon, unreadIcon := trayIcons()
@@ -127,6 +139,30 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		app.Quit()
 	})
 	tray.SetMenu(menu)
+	// Tray Show and Hide are no-ops until the native tray exists, so the initial state is applied after launch.
+	if !menuBarIconEnabled() {
+		app.Event.OnApplicationEvent(events.Common.ApplicationStarted, func(_ *application.ApplicationEvent) {
+			tray.Hide()
+		})
+	}
+	service.setMenuBarIcon = func(enabled bool) {
+		if enabled {
+			tray.Show()
+			return
+		}
+		tray.Hide()
+		window.Show()
+	}
+	service.chooseSavePath = func(directory, filename string) (string, error) {
+		dialog := app.Dialog.SaveFile().SetFilename(filename).AttachToWindow(window)
+		if directory != "" {
+			dialog.SetDirectory(directory)
+		}
+		return dialog.PromptForSingleSelection()
+	}
+	service.chooseDownloadFolder = func() (string, error) {
+		return app.Dialog.OpenFile().CanChooseFiles(false).CanChooseDirectories(true).AttachToWindow(window).PromptForSingleSelection()
+	}
 
 	emitHostError := func(hostErr error) {
 		if hostErr != nil {
@@ -134,7 +170,11 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		}
 	}
 	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
-		if minimizeToTray, _ := preferences.All()["window.minimize_to_tray"].(bool); minimizeToTray {
+		if quitOnClose, _ := preferences.All()["window.quit_on_close"].(bool); quitOnClose {
+			app.Quit()
+			return
+		}
+		if minimizeToTray, _ := preferences.All()["window.minimize_to_tray"].(bool); minimizeToTray && menuBarIconEnabled() {
 			event.Cancel()
 			window.Hide()
 		}
@@ -176,9 +216,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	})
 	service.startScheduledJobWorker()
 
-	if client.IsLoggedIn() {
-		service.startSync()
-	}
+	service.startSync()
 
 	err = app.Run()
 	shutdown()

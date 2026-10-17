@@ -6,24 +6,27 @@ import (
 )
 
 type keyMap struct {
-	Quit           key.Binding
-	Help           key.Binding
-	FocusRooms     key.Binding
-	FocusTimeline  key.Binding
-	FocusComposer  key.Binding
-	FilterAll      key.Binding
-	FilterUnread   key.Binding
-	FilterFavorite key.Binding
-	FilterNeeds    key.Binding
-	Reply          key.Binding
-	Edit           key.Binding
-	MarkRead       key.Binding
-	NextRoom       key.Binding
-	PrevRoom       key.Binding
-	OpenMedia      key.Binding
-	ViewImage      key.Binding
-	Retry          key.Binding
-	Delete         key.Binding
+	Quit             key.Binding
+	Help             key.Binding
+	FocusRooms       key.Binding
+	FocusTimeline    key.Binding
+	FocusComposer    key.Binding
+	FilterAll        key.Binding
+	FilterUnread     key.Binding
+	FilterFavorite   key.Binding
+	FilterNeeds      key.Binding
+	Reply            key.Binding
+	Edit             key.Binding
+	MarkRead         key.Binding
+	NextRoom         key.Binding
+	PrevRoom         key.Binding
+	OpenMedia        key.Binding
+	PlayAudio        key.Binding
+	RecordVoice      key.Binding
+	SelectMicrophone key.Binding
+	ViewImage        key.Binding
+	Retry            key.Binding
+	Delete           key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
@@ -37,7 +40,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Quit, k.Help},
 		{k.FocusRooms, k.FocusTimeline, k.FocusComposer},
 		{k.FilterAll, k.FilterUnread, k.FilterFavorite, k.FilterNeeds},
-		{k.NextRoom, k.PrevRoom, k.Reply, k.Edit, k.MarkRead, k.OpenMedia, k.ViewImage, k.Retry, k.Delete},
+		{k.NextRoom, k.PrevRoom, k.Reply, k.Edit, k.MarkRead, k.OpenMedia, k.PlayAudio, k.RecordVoice, k.SelectMicrophone, k.ViewImage, k.Retry, k.Delete},
 	}
 }
 
@@ -101,6 +104,18 @@ var keys = keyMap{
 	OpenMedia: key.NewBinding(
 		key.WithKeys("o"),
 		key.WithHelp("o", "open attachment"),
+	),
+	PlayAudio: key.NewBinding(
+		key.WithKeys("p"),
+		key.WithHelp("p", "play audio message"),
+	),
+	RecordVoice: key.NewBinding(
+		key.WithKeys("ctrl+r"),
+		key.WithHelp("ctrl+r", "record voice note"),
+	),
+	SelectMicrophone: key.NewBinding(
+		key.WithKeys("ctrl+m"),
+		key.WithHelp("ctrl+m", "select microphone"),
 	),
 	ViewImage: key.NewBinding(
 		key.WithKeys("v"),

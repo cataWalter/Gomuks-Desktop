@@ -632,6 +632,27 @@ func TestApplySyncClassifiesUnmarkedDirectRoomsByMemberCount(t *testing.T) {
 	}
 }
 
+func TestNotificationCategoryClassifiesDirectMentionAndGroup(t *testing.T) {
+	tests := []struct {
+		name      string
+		direct    bool
+		highlight bool
+		want      string
+	}{
+		{name: "direct room", direct: true, highlight: false, want: NotificationCategoryDirect},
+		{name: "direct highlight stays direct", direct: true, highlight: true, want: NotificationCategoryDirect},
+		{name: "group mention", direct: false, highlight: true, want: NotificationCategoryMention},
+		{name: "group message", direct: false, highlight: false, want: NotificationCategoryGroup},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := notificationCategory(test.direct, test.highlight); got != test.want {
+				t.Fatalf("notificationCategory(%v, %v) = %q, want %q", test.direct, test.highlight, got, test.want)
+			}
+		})
+	}
+}
+
 func TestMissingMatrixMediaErrorIsRecognized(t *testing.T) {
 	if !isMissingMatrixMediaError(fmt.Errorf("download Matrix media: %w", mautrix.MNotFound)) {
 		t.Fatal("wrapped M_NOT_FOUND error was not recognized")

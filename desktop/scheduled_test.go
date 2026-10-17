@@ -17,7 +17,7 @@ func TestScheduledJobStorePersistsAndRecoversInterruptedSend(t *testing.T) {
 	}
 
 	dueAt := time.Now().Add(time.Hour).UnixMilli()
-	job, err := store.scheduleMessage("!room:example.org", "send later", dueAt)
+	job, err := store.scheduleMessage(primaryAccountID, "!room:example.org", "send later", dueAt)
 	if err != nil {
 		t.Fatalf("schedule message: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestScheduledJobStoreReschedulesCancelsAndFiresReminders(t *testing.T) {
 		t.Fatalf("create scheduled job store: %v", err)
 	}
 
-	message, err := store.scheduleMessage("!room:example.org", "change this", time.Now().Add(time.Hour).UnixMilli())
+	message, err := store.scheduleMessage(primaryAccountID, "!room:example.org", "change this", time.Now().Add(time.Hour).UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestScheduledJobStoreReschedulesCancelsAndFiresReminders(t *testing.T) {
 		t.Fatalf("cancelled message remained in pending list: %+v", jobs)
 	}
 
-	reminder, err := store.scheduleReminder("!room:example.org", "$event", "Follow up", time.Now().Add(time.Hour).UnixMilli())
+	reminder, err := store.scheduleReminder(primaryAccountID, "!room:example.org", "$event", "Follow up", time.Now().Add(time.Hour).UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestScheduledJobStoreKeepsLateSendVisibleUntilDismissed(t *testing.T) {
 		t.Fatalf("create scheduled job store: %v", err)
 	}
 	dueAt := time.Now().Add(time.Hour).UnixMilli()
-	job, err := store.scheduleMessage("!room:example.org", "send later", dueAt)
+	job, err := store.scheduleMessage(primaryAccountID, "!room:example.org", "send later", dueAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestScheduledReplyPersistsTargetAndDispatchesAsReply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create scheduled job store: %v", err)
 	}
-	job, err := store.scheduleReply("!room:example.org", "follow up", "$quoted-event", time.Now().Add(time.Hour).UnixMilli())
+	job, err := store.scheduleReply(primaryAccountID, "!room:example.org", "follow up", "$quoted-event", time.Now().Add(time.Hour).UnixMilli())
 	if err != nil {
 		t.Fatalf("schedule reply: %v", err)
 	}
@@ -143,6 +143,79 @@ func TestScheduledReplyPersistsTargetAndDispatchesAsReply(t *testing.T) {
 	}
 	if sender.messageCalls != 1 || sender.replyCalls != 1 {
 		t.Fatalf("legacy dispatch = %+v", sender)
+	}
+}
+
+func TestScheduledJobsAreScopedToTheirAccount(t *testing.T) {
+	store, err := newScheduledJobStore(filepath.Join(t.TempDir(), "scheduled-jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueAt := time.Now().Add(time.Hour).UnixMilli()
+	primaryJob, err := store.scheduleMessage(primaryAccountID, "!room:example.org", "primary send", dueAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryJob, err := store.scheduleMessage("account-2", "!room:example.org", "secondary send", dueAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primaryJobs, err := store.claimDueForAccount(scheduledMessageKind, dueAt, primaryAccountID)
+	if err != nil || len(primaryJobs) != 1 || primaryJobs[0].ID != primaryJob.ID {
+		t.Fatalf("primary account claimed jobs = %+v, %v", primaryJobs, err)
+	}
+	secondaryJobs, err := store.claimDueForAccount(scheduledMessageKind, dueAt, "account-2")
+	if err != nil || len(secondaryJobs) != 1 || secondaryJobs[0].ID != secondaryJob.ID {
+		t.Fatalf("secondary account claimed jobs = %+v, %v", secondaryJobs, err)
+	}
+	if jobs := store.listForAccount(primaryAccountID); len(jobs) != 1 || jobs[0].ID != primaryJob.ID {
+		t.Fatalf("primary account job list = %+v", jobs)
+	}
+}
+
+func TestScheduledMessagesDispatchThroughOwningAccount(t *testing.T) {
+	store, err := newScheduledJobStore(filepath.Join(t.TempDir(), "scheduled-jobs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dueAt := time.Now().Add(time.Hour).UnixMilli()
+	if _, err = store.scheduleMessage(primaryAccountID, "!room:example.org", "primary send", dueAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.scheduleMessage("account-2", "!room:example.org", "secondary send", dueAt); err != nil {
+		t.Fatal(err)
+	}
+	primarySender := &scheduledSenderProbe{}
+	secondarySender := &scheduledSenderProbe{}
+
+	if err = dispatchDueScheduledMessagesForAccount(context.Background(), store, primaryAccountID, primarySender, dueAt); err != nil {
+		t.Fatal(err)
+	}
+	if primarySender.messageCalls != 1 || secondarySender.messageCalls != 0 {
+		t.Fatalf("primary dispatch counts = primary:%d secondary:%d", primarySender.messageCalls, secondarySender.messageCalls)
+	}
+	if err = dispatchDueScheduledMessagesForAccount(context.Background(), store, "account-2", secondarySender, dueAt); err != nil {
+		t.Fatal(err)
+	}
+	if primarySender.messageCalls != 1 || secondarySender.messageCalls != 1 {
+		t.Fatalf("account dispatch counts = primary:%d secondary:%d", primarySender.messageCalls, secondarySender.messageCalls)
+	}
+}
+
+func TestScheduledJobWithoutAccountIDBelongsToPrimaryAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scheduled-jobs.json")
+	legacy := `[{"id":"legacy-job","kind":"message","roomId":"!room:example.org","text":"legacy send","dueAt":4102444800000,"createdAt":1,"status":"pending","error":""}]`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newScheduledJobStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := store.listForAccount(primaryAccountID)
+	if len(jobs) != 1 || jobs[0].AccountID != primaryAccountID {
+		t.Fatalf("migrated legacy jobs = %+v", jobs)
 	}
 }
 

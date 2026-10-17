@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,30 +19,44 @@ import (
 )
 
 type AppService struct {
-	client       *matrix.Client
-	preferences  *PreferenceStore
-	notifier     notifications.Notifier
-	ctx          context.Context
-	cancel       context.CancelFunc
-	quit         func()
-	setAutostart func(bool) error
-	activeRoomMu sync.RWMutex
-	activeRoomID string
-	workers      sync.WaitGroup
-	scheduled    *scheduledJobStore
+	client               *matrix.Client
+	clientMu             sync.RWMutex
+	accountMu            sync.RWMutex
+	accountRegistry      *accountRegistry
+	accountClients       map[string]*matrix.Client
+	accountEventPumps    map[string]bool
+	accountSyncStarted   map[string]bool
+	accountDataDir       string
+	accountMediaCacheDir string
+	activeAccountID      string
+	preferences          *PreferenceStore
+	notifier             notifications.Notifier
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	quit                 func()
+	setAutostart         func(bool) error
+	setMenuBarIcon       func(bool)
+	chooseSavePath       func(directory, filename string) (string, error)
+	chooseDownloadFolder func() (string, error)
+	activeRoomMu         sync.RWMutex
+	activeRoomID         string
+	workers              sync.WaitGroup
+	scheduled            *scheduledJobStore
 
 	emitUpdate   func(Update)
 	emitReminder func(ScheduledJob)
 }
 
 type Snapshot struct {
-	LoggedIn          bool           `json:"loggedIn"`
-	NeedsVerification bool           `json:"needsVerification"`
-	SyncReady         bool           `json:"syncReady"`
-	ConnectionState   string         `json:"connectionState"`
-	Profile           AccountProfile `json:"profile"`
-	Rooms             []Room         `json:"rooms"`
-	Preferences       map[string]any `json:"preferences"`
+	LoggedIn          bool             `json:"loggedIn"`
+	NeedsVerification bool             `json:"needsVerification"`
+	SyncReady         bool             `json:"syncReady"`
+	ConnectionState   string           `json:"connectionState"`
+	Profile           AccountProfile   `json:"profile"`
+	Accounts          []AccountSummary `json:"accounts"`
+	ActiveAccountID   string           `json:"activeAccountId"`
+	Rooms             []Room           `json:"rooms"`
+	Preferences       map[string]any   `json:"preferences"`
 }
 
 type Room struct {
@@ -54,12 +70,14 @@ type Room struct {
 	Favorite        bool   `json:"favorite"`
 	Muted           bool   `json:"muted"`
 	Unread          int    `json:"unread"`
+	MarkedUnread    bool   `json:"markedUnread"`
 	Mentions        int    `json:"mentions"`
 	Unanswered      bool   `json:"unanswered"`
 	LastEventID     string `json:"lastEventId"`
 	LastEventSender string `json:"lastEventSender"`
 	LastEventAt     int64  `json:"lastEventAt"`
 	Bridge          string `json:"bridge"`
+	AccountID       string `json:"accountId"`
 }
 
 type AccountProfile struct {
@@ -90,6 +108,7 @@ type Message struct {
 	Reactions       map[string]int  `json:"reactions"`
 	Reacted         map[string]bool `json:"reacted"`
 	MediaURI        string          `json:"mediaUri"`
+	MediaType       string          `json:"mediaType"`
 	MediaMIME       string          `json:"mediaMime"`
 	MediaSize       int             `json:"mediaSize"`
 	MediaWidth      int             `json:"mediaWidth"`
@@ -136,6 +155,28 @@ type MediaCacheUsage struct {
 	Files int   `json:"files"`
 }
 
+// RoomStorage is an approximate per-chat storage attribution.
+type RoomStorage struct {
+	RoomID     string `json:"roomId"`
+	Name       string `json:"name"`
+	Messages   int    `json:"messages"`
+	TextBytes  int64  `json:"textBytes"`
+	MediaBytes int64  `json:"mediaBytes"`
+	MediaFiles int    `json:"mediaFiles"`
+}
+
+// MediaCleanupRequest selects cached media to delete. Empty or zero fields match everything.
+type MediaCleanupRequest struct {
+	RoomID        string `json:"roomId"`
+	OlderThanDays int    `json:"olderThanDays"`
+	MediaType     string `json:"mediaType"`
+}
+
+type MediaCleanupResult struct {
+	Files int   `json:"files"`
+	Bytes int64 `json:"bytes"`
+}
+
 type Notification struct {
 	RoomID  string `json:"roomId"`
 	Room    string `json:"room"`
@@ -157,17 +198,19 @@ type Update struct {
 }
 
 func (s *AppService) Snapshot() (Snapshot, error) {
-	if err := s.client.WaitForCache(s.ctx); err != nil {
+	client := s.currentClient()
+	if err := client.WaitForCache(s.ctx); err != nil {
 		return Snapshot{}, err
 	}
-	profile := s.client.Profile()
+	profile := client.Profile()
 	preferences := s.preferences.All()
-	rooms := mapRoomsWithPreferences(s.client.Rooms(), preferences)
+	rooms := mapRoomsWithPreferences(client.Rooms(), preferences)
+	tagRooms(rooms, s.currentAccountID())
 	return Snapshot{
-		LoggedIn:          s.client.IsLoggedIn(),
-		NeedsVerification: s.client.NeedsVerification(),
-		SyncReady:         s.client.SyncReady(),
-		ConnectionState:   string(s.client.ConnectionState()),
+		LoggedIn:          client.IsLoggedIn(),
+		NeedsVerification: client.NeedsVerification(),
+		SyncReady:         client.SyncReady(),
+		ConnectionState:   string(client.ConnectionState()),
 		Profile: AccountProfile{
 			UserID:      profile.UserID,
 			DisplayName: profile.DisplayName,
@@ -176,17 +219,37 @@ func (s *AppService) Snapshot() (Snapshot, error) {
 			AvatarURI:   profile.AvatarURI,
 			Verified:    profile.Verified,
 		},
-		Rooms:       rooms,
-		Preferences: preferences,
+		Accounts:        s.Accounts(),
+		ActiveAccountID: s.currentAccountID(),
+		Rooms:           rooms,
+		Preferences:     preferences,
 	}, nil
 }
 
 func (s *AppService) Login(homeserver, username, password string) error {
-	return s.client.Login(s.ctx, homeserver, username, password)
+	client := s.currentClient()
+	if err := client.Login(s.ctx, homeserver, username, password); err != nil {
+		return err
+	}
+	if s.accountRegistry != nil {
+		account := accountSummary(s.currentAccountID(), client)
+		if err := s.accountRegistry.Upsert(account); err != nil {
+			return err
+		}
+		return s.accountRegistry.SetActive(account.ID)
+	}
+	return nil
 }
 
 func (s *AppService) Verify(recoveryKey string) error {
-	return s.client.Verify(s.ctx, recoveryKey)
+	client := s.currentClient()
+	if err := client.Verify(s.ctx, recoveryKey); err != nil {
+		return err
+	}
+	if s.accountRegistry != nil {
+		return s.accountRegistry.Upsert(accountSummary(s.currentAccountID(), client))
+	}
+	return nil
 }
 
 func (s *AppService) History(roomID string, before int64) (HistoryPage, error) {
@@ -198,7 +261,7 @@ func (s *AppService) History(roomID string, before int64) (HistoryPage, error) {
 			}
 		}
 	}
-	page, err := s.client.HistoryPageWithLimit(s.ctx, roomID, before, initialLimit)
+	page, err := s.currentClient().HistoryPageWithLimit(s.ctx, roomID, before, initialLimit)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -210,39 +273,43 @@ func (s *AppService) History(roomID string, before int64) (HistoryPage, error) {
 }
 
 func (s *AppService) SendMessage(roomID, text string) error {
-	return s.client.SendMessage(s.ctx, roomID, text)
+	return s.currentClient().SendMessage(s.ctx, roomID, text)
 }
 
 func (s *AppService) SendMessageWithMentions(roomID, text string, userIDs []string) error {
-	return s.client.SendMessageWithMentions(s.ctx, roomID, text, userIDs)
+	return s.currentClient().SendMessageWithMentions(s.ctx, roomID, text, userIDs)
 }
 
 func (s *AppService) SendReply(roomID, text, replyTo string) error {
-	return s.client.SendReply(s.ctx, roomID, text, replyTo)
+	return s.currentClient().SendReply(s.ctx, roomID, text, replyTo)
 }
 
 func (s *AppService) EditMessage(roomID, text, eventID string) error {
-	return s.client.EditMessage(s.ctx, roomID, text, eventID)
+	return s.currentClient().EditMessage(s.ctx, roomID, text, eventID)
 }
 
 func (s *AppService) React(roomID, eventID, emoji string) error {
-	return s.client.React(s.ctx, roomID, eventID, emoji)
+	return s.currentClient().React(s.ctx, roomID, eventID, emoji)
 }
 
 func (s *AppService) RedactMessage(roomID, eventID string) error {
-	return s.client.RedactMessage(s.ctx, roomID, eventID)
+	return s.currentClient().RedactMessage(s.ctx, roomID, eventID)
 }
 
 func (s *AppService) RetryMessage(transactionID string) error {
-	return s.client.RetryMessage(s.ctx, transactionID)
+	return s.currentClient().RetryMessage(s.ctx, transactionID)
 }
 
 func (s *AppService) MarkRead(roomID, eventID string) error {
-	return s.client.MarkRead(s.ctx, roomID, eventID)
+	return s.currentClient().MarkRead(s.ctx, roomID, eventID)
+}
+
+func (s *AppService) MarkUnread(roomID string) error {
+	return s.currentClient().MarkUnread(s.ctx, roomID)
 }
 
 func (s *AppService) SetTyping(roomID string, timeoutMilliseconds int64) error {
-	return s.client.SetTyping(s.ctx, roomID, time.Duration(timeoutMilliseconds)*time.Millisecond)
+	return s.currentClient().SetTyping(s.ctx, roomID, time.Duration(timeoutMilliseconds)*time.Millisecond)
 }
 
 type MessageSearchRequest struct {
@@ -266,7 +333,7 @@ type MessageSearchPage struct {
 }
 
 func (s *AppService) SearchMessages(request MessageSearchRequest) (MessageSearchPage, error) {
-	page, err := s.client.SearchMessages(s.ctx, matrix.SearchRequest{
+	page, err := s.currentClient().SearchMessages(s.ctx, matrix.SearchRequest{
 		Query:        request.Query,
 		RoomID:       request.RoomID,
 		Sender:       request.Sender,
@@ -292,28 +359,28 @@ func (s *AppService) ScheduleMessage(roomID, text string, dueAt int64) (Schedule
 	if err := s.validateScheduledRoom(roomID); err != nil {
 		return ScheduledJob{}, err
 	}
-	return s.scheduled.scheduleMessage(roomID, text, dueAt)
+	return s.scheduled.scheduleMessage(s.currentAccountID(), roomID, text, dueAt)
 }
 
 func (s *AppService) ScheduleReply(roomID, text, replyToEventID string, dueAt int64) (ScheduledJob, error) {
 	if err := s.validateScheduledRoom(roomID); err != nil {
 		return ScheduledJob{}, err
 	}
-	return s.scheduled.scheduleReply(roomID, text, replyToEventID, dueAt)
+	return s.scheduled.scheduleReply(s.currentAccountID(), roomID, text, replyToEventID, dueAt)
 }
 
 func (s *AppService) ScheduleReminder(roomID, eventID, text string, dueAt int64) (ScheduledJob, error) {
 	if err := s.validateScheduledRoom(roomID); err != nil {
 		return ScheduledJob{}, err
 	}
-	return s.scheduled.scheduleReminder(roomID, eventID, text, dueAt)
+	return s.scheduled.scheduleReminder(s.currentAccountID(), roomID, eventID, text, dueAt)
 }
 
 func (s *AppService) ScheduledJobs() []ScheduledJob {
 	if s.scheduled == nil {
 		return []ScheduledJob{}
 	}
-	return s.scheduled.list()
+	return s.scheduled.listForAccount(s.currentAccountID())
 }
 
 func (s *AppService) UpdateScheduledJob(id string, dueAt int64) error {
@@ -351,7 +418,7 @@ func (s *AppService) validateScheduledRoom(roomID string) error {
 	if roomID == "" {
 		return errors.New("select a room first")
 	}
-	for _, room := range s.client.Rooms() {
+	for _, room := range s.currentClient().Rooms() {
 		if room.ID == roomID {
 			return nil
 		}
@@ -360,7 +427,7 @@ func (s *AppService) validateScheduledRoom(roomID string) error {
 }
 
 func (s *AppService) RoomMembers(roomID string) ([]Member, error) {
-	members, err := s.client.RoomMembers(s.ctx, roomID)
+	members, err := s.currentClient().RoomMembers(s.ctx, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -372,11 +439,11 @@ func (s *AppService) RoomMembers(roomID string) ([]Member, error) {
 }
 
 func (s *AppService) LeaveRoom(roomID string) error {
-	return s.client.LeaveRoom(s.ctx, roomID)
+	return s.currentClient().LeaveRoom(s.ctx, roomID)
 }
 
 func (s *AppService) Devices() ([]Device, error) {
-	devices, err := s.client.Devices(s.ctx)
+	devices, err := s.currentClient().Devices(s.ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -398,34 +465,111 @@ func (s *AppService) Devices() ([]Device, error) {
 }
 
 func (s *AppService) RevokeDevice(deviceID string) error {
-	return s.client.RevokeDevice(s.ctx, deviceID)
+	return s.currentClient().RevokeDevice(s.ctx, deviceID)
 }
 
 func (s *AppService) ExportRoomKeys(passphrase string) ([]byte, error) {
-	return s.client.ExportRoomKeys(s.ctx, passphrase)
+	return s.currentClient().ExportRoomKeys(s.ctx, passphrase)
 }
 
 func (s *AppService) ImportRoomKeys(passphrase string, data []byte) (RoomKeyImportResult, error) {
-	imported, total, err := s.client.ImportRoomKeys(s.ctx, passphrase, data)
+	imported, total, err := s.currentClient().ImportRoomKeys(s.ctx, passphrase, data)
 	if err != nil {
 		return RoomKeyImportResult{}, err
 	}
 	return RoomKeyImportResult{Imported: imported, Total: total}, nil
 }
 
-func (s *AppService) SendAttachment(roomID, filename string, data []byte) error {
+func (s *AppService) SendAttachment(roomID, filename string, data []byte, voiceNote bool, durationMilliseconds int64) error {
 	if int64(len(data)) > maxAttachmentSize {
 		return fmt.Errorf("attachment exceeds the 50 MiB limit")
 	}
-	return s.client.SendAttachment(s.ctx, roomID, filename, data)
+	if voiceNote {
+		return s.currentClient().SendVoiceNote(s.ctx, roomID, filename, data, durationMilliseconds)
+	}
+	return s.currentClient().SendAttachment(s.ctx, roomID, filename, data)
 }
 
 func (s *AppService) DownloadMedia(mxc string) ([]byte, error) {
-	return s.client.CachedMediaBytes(s.ctx, mxc)
+	return s.currentClient().CachedMediaBytes(s.ctx, mxc)
+}
+
+// SaveMedia writes a cached attachment to the download folder, or to a path chosen in a save dialog when ask-each-time is enabled. An empty path with no error means the user cancelled.
+func (s *AppService) SaveMedia(mxc, filename string) (string, error) {
+	data, err := s.currentClient().CachedMediaBytes(s.ctx, mxc)
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", errors.New("no media data to save")
+	}
+	name := safeDownloadName(filename)
+	preferences := s.preferences.All()
+	directory, _ := preferences["downloads.folder"].(string)
+	if directory == "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return "", homeErr
+		}
+		directory = filepath.Join(home, "Downloads")
+	}
+	askEach, _ := preferences["downloads.ask_each_time"].(bool)
+	target := ""
+	if askEach {
+		if s.chooseSavePath == nil {
+			return "", errors.New("save dialog is unavailable")
+		}
+		target, err = s.chooseSavePath(directory, name)
+		if err != nil {
+			return "", err
+		}
+		if target == "" {
+			return "", nil
+		}
+	} else {
+		target = uniqueDownloadPath(directory, name)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", fmt.Errorf("create download folder: %w", err)
+	}
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return "", fmt.Errorf("save attachment: %w", err)
+	}
+	return target, nil
+}
+
+// ChooseDownloadFolder opens a native folder picker and returns the selected directory, or an empty string when cancelled.
+func (s *AppService) ChooseDownloadFolder() (string, error) {
+	if s.chooseDownloadFolder == nil {
+		return "", errors.New("folder picker is unavailable")
+	}
+	return s.chooseDownloadFolder()
+}
+
+func safeDownloadName(filename string) string {
+	name := filepath.Base(strings.TrimSpace(filename))
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) {
+		return "attachment"
+	}
+	return name
+}
+
+// uniqueDownloadPath returns a path in directory that does not overwrite an existing file, appending " (n)" before the extension when needed.
+func uniqueDownloadPath(directory, name string) string {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	candidate := filepath.Join(directory, name)
+	for i := 1; i < 1000; i++ {
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		}
+		candidate = filepath.Join(directory, fmt.Sprintf("%s (%d)%s", base, i, ext))
+	}
+	return candidate
 }
 
 func (s *AppService) DownloadAvatar(mxc string) (string, error) {
-	data, err := s.client.DownloadAvatar(s.ctx, mxc)
+	data, err := s.currentClient().DownloadAvatar(s.ctx, mxc)
 	if err != nil {
 		return "", err
 	}
@@ -440,7 +584,7 @@ func (s *AppService) DownloadAvatar(mxc string) (string, error) {
 }
 
 func (s *AppService) StorageUsage() (StorageUsage, error) {
-	databaseBytes, walBytes, err := s.client.StorageUsage()
+	databaseBytes, walBytes, err := s.currentClient().StorageUsage()
 	if err != nil {
 		return StorageUsage{}, err
 	}
@@ -448,7 +592,7 @@ func (s *AppService) StorageUsage() (StorageUsage, error) {
 }
 
 func (s *AppService) MediaCacheUsage() (MediaCacheUsage, error) {
-	bytes, files, err := s.client.MediaCacheUsage()
+	bytes, files, err := s.currentClient().MediaCacheUsage()
 	if err != nil {
 		return MediaCacheUsage{}, err
 	}
@@ -456,15 +600,65 @@ func (s *AppService) MediaCacheUsage() (MediaCacheUsage, error) {
 }
 
 func (s *AppService) ClearMediaCache() error {
-	return s.client.ClearMediaCache()
+	return s.currentClient().ClearMediaCache()
+}
+
+// RoomStorageUsage reports cached media and approximate message storage per chat.
+func (s *AppService) RoomStorageUsage() ([]RoomStorage, error) {
+	usage, err := s.currentClient().RoomStorageUsage(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]RoomStorage, 0, len(usage))
+	for _, entry := range usage {
+		result = append(result, RoomStorage{
+			RoomID:     entry.RoomID,
+			Name:       entry.Name,
+			Messages:   entry.Messages,
+			TextBytes:  entry.TextBytes,
+			MediaBytes: entry.MediaBytes,
+			MediaFiles: entry.MediaFiles,
+		})
+	}
+	return result, nil
+}
+
+// ClearCachedMedia deletes cached media matching the request. Messages are kept.
+func (s *AppService) ClearCachedMedia(request MediaCleanupRequest) (MediaCleanupResult, error) {
+	filter, err := mediaCleanupFilter(request, time.Now())
+	if err != nil {
+		return MediaCleanupResult{}, err
+	}
+	result, err := s.currentClient().ClearCachedMedia(s.ctx, filter)
+	if err != nil {
+		return MediaCleanupResult{}, err
+	}
+	return MediaCleanupResult{Files: result.Files, Bytes: result.Bytes}, nil
+}
+
+func mediaCleanupFilter(request MediaCleanupRequest, now time.Time) (matrix.MediaCleanupFilter, error) {
+	if request.OlderThanDays < 0 {
+		return matrix.MediaCleanupFilter{}, errors.New("age must be zero or more days")
+	}
+	filter := matrix.MediaCleanupFilter{
+		RoomID:    strings.TrimSpace(request.RoomID),
+		MediaType: strings.TrimSpace(request.MediaType),
+	}
+	if request.OlderThanDays > 0 {
+		filter.OlderThan = now.AddDate(0, 0, -request.OlderThanDays)
+	}
+	if err := filter.Validate(); err != nil {
+		return matrix.MediaCleanupFilter{}, err
+	}
+	return filter, nil
 }
 
 func (s *AppService) OptimizeDatabase() error {
-	return s.client.OptimizeDatabase(s.ctx)
+	return s.currentClient().OptimizeDatabase(s.ctx)
 }
 
 func (s *AppService) SetRoomUnanswered(roomID string, unanswered bool) error {
-	return s.client.SetRoomUnanswered(s.ctx, roomID, unanswered)
+	return s.currentClient().SetRoomUnanswered(s.ctx, roomID, unanswered)
 }
 
 func (s *AppService) SetBooleanPreference(key string, value bool) error {
@@ -481,7 +675,13 @@ func (s *AppService) SetBooleanPreference(key string, value bool) error {
 		}
 		return nil
 	}
-	return s.preferences.Set(key, value)
+	if err := s.preferences.Set(key, value); err != nil {
+		return err
+	}
+	if key == "window.menu_bar_icon" && s.setMenuBarIcon != nil {
+		s.setMenuBarIcon(value)
+	}
+	return nil
 }
 
 func (s *AppService) SetActiveRoom(roomID string) {
@@ -509,7 +709,7 @@ func (s *AppService) sendDroppedFiles(paths []string) (string, bool, error) {
 			combinedErr = errors.Join(combinedErr, err)
 			continue
 		}
-		if err = s.SendAttachment(roomID, filename, data); err != nil {
+		if err = s.SendAttachment(roomID, filename, data, false, 0); err != nil {
 			combinedErr = errors.Join(combinedErr, fmt.Errorf("send dropped file %q: %w", filename, err))
 			continue
 		}
@@ -520,8 +720,9 @@ func (s *AppService) sendDroppedFiles(paths []string) (string, bool, error) {
 
 func (s *AppService) markAllRead() error {
 	var combinedErr error
-	for _, room := range s.client.Rooms() {
-		page, err := s.client.HistoryPage(s.ctx, room.ID, 0)
+	client := s.currentClient()
+	for _, room := range client.Rooms() {
+		page, err := client.HistoryPage(s.ctx, room.ID, 0)
 		if err != nil {
 			combinedErr = errors.Join(combinedErr, fmt.Errorf("load history for %s: %w", room.ID, err))
 			continue
@@ -531,7 +732,7 @@ func (s *AppService) markAllRead() error {
 			if message.ID == "" || strings.HasPrefix(message.ID, "~") {
 				continue
 			}
-			if err = s.client.MarkRead(s.ctx, room.ID, message.ID); err != nil {
+			if err = client.MarkRead(s.ctx, room.ID, message.ID); err != nil {
 				combinedErr = errors.Join(combinedErr, fmt.Errorf("mark room %s as read: %w", room.ID, err))
 			}
 			break
@@ -573,8 +774,32 @@ func (s *AppService) SendNotification(title, body, roomID string) (bool, error) 
 }
 
 func (s *AppService) Logout() error {
-	if err := s.client.Logout(s.ctx); err != nil {
+	accountID := s.currentAccountID()
+	client := s.currentClient()
+	if err := client.Logout(s.ctx); err != nil {
 		return err
+	}
+	clients := s.accountClientsSnapshot()
+	s.accountMu.RLock()
+	registry := s.accountRegistry
+	s.accountMu.RUnlock()
+	if registry != nil {
+		for _, account := range registry.All() {
+			nextClient := clients[account.ID]
+			if account.ID == accountID || nextClient == nil || !nextClient.IsLoggedIn() {
+				continue
+			}
+			if err := registry.SetActive(account.ID); err != nil {
+				return err
+			}
+			s.accountMu.Lock()
+			s.activeAccountID = account.ID
+			s.accountMu.Unlock()
+			s.clientMu.Lock()
+			s.client = nextClient
+			s.clientMu.Unlock()
+			return nil
+		}
 	}
 	if s.quit != nil {
 		s.quit()
@@ -583,36 +808,42 @@ func (s *AppService) Logout() error {
 }
 
 func (s *AppService) startEventPump(emit func(Update)) {
+	s.accountMu.Lock()
 	s.emitUpdate = emit
-	s.workers.Add(1)
-	go func() {
-		defer s.workers.Done()
-		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			case update, ok := <-s.client.Events():
-				if !ok || s.ctx.Err() != nil {
-					return
-				}
-				emit(mapUpdate(update, s.preferences.All()))
-			}
-		}
-	}()
+	s.accountMu.Unlock()
+	for accountID, client := range s.accountClientsSnapshot() {
+		s.startAccountEventPump(accountID, client)
+	}
 }
 
 func (s *AppService) startSync() {
+	for accountID, client := range s.accountClientsSnapshot() {
+		s.startAccountSync(accountID, client)
+	}
+}
+
+func (s *AppService) startAccountSync(accountID string, client *matrix.Client) {
+	s.accountMu.Lock()
+	if s.accountSyncStarted == nil {
+		s.accountSyncStarted = make(map[string]bool)
+	}
+	if s.accountSyncStarted[accountID] || !client.IsLoggedIn() || s.ctx.Err() != nil {
+		s.accountMu.Unlock()
+		return
+	}
+	s.accountSyncStarted[accountID] = true
 	s.workers.Add(1)
+	s.accountMu.Unlock()
 	go func() {
 		defer s.workers.Done()
-		if err := s.client.StartWithRetry(s.ctx); err != nil && s.ctx.Err() == nil && s.emitUpdate != nil {
+		if err := client.StartWithRetry(s.ctx); err != nil && s.ctx.Err() == nil && s.currentAccountID() == accountID && s.emitUpdate != nil {
 			s.emitUpdate(Update{Error: err.Error(), ConnectionState: string(matrix.StateOffline)})
 		}
 	}()
 }
 
 func (s *AppService) startScheduledJobWorker() {
-	if s.scheduled == nil || s.client == nil {
+	if s.scheduled == nil || s.currentClient() == nil {
 		return
 	}
 	s.workers.Add(1)
@@ -644,24 +875,35 @@ func dispatchScheduledMessage(ctx context.Context, sender scheduledMessageSender
 	return sender.SendMessage(ctx, job.RoomID, job.Text)
 }
 
+func dispatchDueScheduledMessagesForAccount(ctx context.Context, store *scheduledJobStore, accountID string, sender scheduledMessageSender, now int64) error {
+	jobs, err := store.claimDueForAccount(scheduledMessageKind, now, accountID)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		startedAt := time.Now().UnixMilli()
+		sendErr := dispatchScheduledMessage(ctx, sender, job)
+		if finishErr := store.finishMessage(job.ID, sendErr, startedAt); finishErr != nil {
+			log.Printf("finish scheduled message %s: %v", job.ID, finishErr)
+		}
+	}
+	return nil
+}
+
 func (s *AppService) processDueScheduledJobs() {
 	if s.scheduled == nil || s.ctx.Err() != nil {
 		return
 	}
-	if s.client.IsLoggedIn() && s.client.ConnectionState() == matrix.StateConnected {
-		jobs, err := s.scheduled.claimDue(scheduledMessageKind, time.Now().UnixMilli())
-		if err != nil {
-			log.Printf("claim scheduled messages: %v", err)
+	now := time.Now().UnixMilli()
+	for accountID, client := range s.accountClientsSnapshot() {
+		if !client.IsLoggedIn() || client.ConnectionState() != matrix.StateConnected {
+			continue
 		}
-		for _, job := range jobs {
-			startedAt := time.Now().UnixMilli()
-			sendErr := dispatchScheduledMessage(s.ctx, s.client, job)
-			if finishErr := s.scheduled.finishMessage(job.ID, sendErr, startedAt); finishErr != nil {
-				log.Printf("finish scheduled message %s: %v", job.ID, finishErr)
-			}
+		if err := dispatchDueScheduledMessagesForAccount(s.ctx, s.scheduled, accountID, client, now); err != nil {
+			log.Printf("claim scheduled messages for account %s: %v", accountID, err)
 		}
 	}
-	reminders, err := s.scheduled.claimDue(scheduledReminderKind, time.Now().UnixMilli())
+	reminders, err := s.scheduled.claimDue(scheduledReminderKind, now)
 	if err != nil {
 		log.Printf("claim scheduled reminders: %v", err)
 		return
@@ -692,6 +934,7 @@ func mapRooms(rooms []matrix.Room) []Room {
 			Favorite:        room.Favorite,
 			Muted:           room.Muted,
 			Unread:          room.Unread,
+			MarkedUnread:    room.MarkedUnread,
 			Mentions:        room.Mentions,
 			Unanswered:      room.Unanswered,
 			LastEventID:     room.LastEventID,
@@ -701,6 +944,13 @@ func mapRooms(rooms []matrix.Room) []Room {
 		})
 	}
 	return mapped
+}
+
+// tagRooms sets the owning account on each room in place.
+func tagRooms(rooms []Room, accountID string) {
+	for i := range rooms {
+		rooms[i].AccountID = accountID
+	}
 }
 
 func mapRoomsWithPreferences(rooms []matrix.Room, preferences map[string]any) []Room {
@@ -734,6 +984,7 @@ func mapMessages(messages []matrix.Message) []Message {
 			Reactions:       message.Reactions,
 			Reacted:         message.Reacted,
 			MediaURI:        message.MediaURI,
+			MediaType:       message.MediaType,
 			MediaMIME:       message.MediaMIME,
 			MediaSize:       message.MediaSize,
 			MediaWidth:      message.MediaWidth,

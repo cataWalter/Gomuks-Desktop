@@ -22,45 +22,55 @@ const (
 )
 
 type Model struct {
-	client        *matrix.Client
-	rooms         roomsModel
-	timeline      timelineModel
-	composer      composerModel
-	login         loginModel
-	help          helpModel
-	focus         Focus
-	showHelp      bool
-	loginActive   bool
-	width         int
-	height        int
-	connection    matrix.ConnectionState
-	roomsList     []matrix.Room
-	currentRoom   *matrix.Room
-	typing        map[string][]string
-	errorMsg      string
-	needsVerif    bool
-	viewer        *imageViewer
-	nativeImages  bool
-	notice        string
-	confirmDelete string
-	notifier      notifications.Notifier
+	client                   *matrix.Client
+	rooms                    roomsModel
+	timeline                 timelineModel
+	composer                 composerModel
+	login                    loginModel
+	help                     helpModel
+	focus                    Focus
+	showHelp                 bool
+	loginActive              bool
+	width                    int
+	height                   int
+	connection               matrix.ConnectionState
+	roomsList                []matrix.Room
+	currentRoom              *matrix.Room
+	typing                   map[string][]string
+	errorMsg                 string
+	needsVerif               bool
+	autoPlayNextAudio        bool
+	autoPlayNextMessage      string
+	viewer                   *imageViewer
+	nativeImages             bool
+	voiceRecorder            *voiceRecorder
+	voiceRoomID              string
+	voiceInputDeviceID       string
+	audioInputDevices        []audioInputDevice
+	audioDevicePickerOpen    bool
+	audioDevicePickerLoading bool
+	audioDevicePickerIndex   int
+	notice                   string
+	confirmDelete            string
+	notifier                 notifications.Notifier
 }
 
 func NewModel(client *matrix.Client) *Model {
 	return &Model{
-		client:      client,
-		rooms:       newRoomsModel(),
-		timeline:    newTimelineModel(),
-		composer:    newComposerModel(),
-		login:       newLoginModel(),
-		help:        newHelpModel(),
-		focus:       FocusRooms,
-		loginActive: client == nil || !client.IsLoggedIn(),
-		showHelp:    false,
-		connection:  matrix.StateOffline,
-		typing:      make(map[string][]string),
-		needsVerif:  false,
-		notifier:    notifications.New(),
+		client:            client,
+		rooms:             newRoomsModel(),
+		timeline:          newTimelineModel(),
+		composer:          newComposerModel(),
+		login:             newLoginModel(),
+		help:              newHelpModel(),
+		focus:             FocusRooms,
+		loginActive:       client == nil || !client.IsLoggedIn(),
+		showHelp:          false,
+		connection:        matrix.StateOffline,
+		typing:            make(map[string][]string),
+		needsVerif:        false,
+		notifier:          notifications.New(),
+		autoPlayNextAudio: true,
 	}
 }
 
@@ -104,10 +114,17 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			if m.voiceRecorder != nil {
+				m.voiceRecorder.Close()
+				m.voiceRecorder = nil
+			}
 			return m, tea.Quit
 		}
 		if m.viewer != nil {
 			return m.handleViewerKey(msg)
+		}
+		if m.audioDevicePickerOpen {
+			return m.updateAudioDevicePicker(msg)
 		}
 		if m.showHelp {
 			if msg.String() == "?" || msg.String() == "q" || msg.String() == "esc" {
@@ -135,6 +152,10 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q":
 			if m.focus == FocusComposer {
 				break
+			}
+			if m.voiceRecorder != nil {
+				m.voiceRecorder.Close()
+				m.voiceRecorder = nil
 			}
 			return m, tea.Quit
 		case "1":
@@ -226,6 +247,50 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if selected := m.timeline.selectedMessage(); selected != nil && selected.MediaURI != "" {
 					return m, openMediaCmd(m.client, *selected)
 				}
+			}
+		case "p":
+			if m.focus == FocusTimeline && m.client != nil {
+				if selected := m.timeline.selectedMessage(); selected != nil && selected.MediaURI != "" && isAudioMessage(*selected) {
+					cmd := openMediaCmd(m.client, *selected)
+					if m.autoPlayNextAudio {
+						// Try to find next audio message after selection
+						for i := m.timeline.selected + 1; i < len(m.timeline.messages); i++ {
+							msg := m.timeline.messages[i]
+							if isAudioMessage(msg) && msg.MediaURI != "" {
+								m.autoPlayNextMessage = msg.ID
+								return m, cmd
+							}
+						}
+					}
+					return m, cmd
+				}
+			}
+		case "ctrl+m":
+			if m.focus == FocusTimeline {
+				m.audioDevicePickerOpen = true
+				m.audioDevicePickerLoading = true
+				return m, audioInputDevicesCmd()
+			}
+		case "ctrl+r":
+			if m.focus == FocusTimeline {
+				if m.voiceRecorder != nil {
+					m.notice = "Sending voice note..."
+					return m, m.finishVoiceRecording()
+				}
+				if m.client == nil || m.currentRoom == nil {
+					m.errorMsg = "Select a room before recording a voice note."
+					return m, nil
+				}
+				recorder, err := startVoiceRecording(m.voiceInputDeviceID)
+				if err != nil {
+					m.errorMsg = err.Error()
+					return m, nil
+				}
+				m.errorMsg = ""
+				m.voiceRecorder = recorder
+				m.voiceRoomID = m.currentRoom.ID
+				m.notice = "Recording voice note; press Ctrl+R to send (4 minute limit)."
+				return m, tea.Tick(maxVoiceRecordingDuration, func(time.Time) tea.Msg { return voiceRecordingLimitMsg{} })
 			}
 		case "v":
 			if m.focus == FocusTimeline {
@@ -348,6 +413,36 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case voiceRecordingLimitMsg:
+		if m.voiceRecorder != nil {
+			m.notice = "Maximum recording time reached; sending voice note..."
+			return m, m.finishVoiceRecording()
+		}
+
+	case audioInputDevicesLoadedMsg:
+		m.audioDevicePickerLoading = false
+		if msg.err != nil {
+			m.audioDevicePickerOpen = false
+			m.errorMsg = msg.err.Error()
+			return m, nil
+		}
+		m.audioInputDevices = msg.devices
+		m.audioDevicePickerIndex = 0
+		for index, device := range msg.devices {
+			if device.id == m.voiceInputDeviceID {
+				m.audioDevicePickerIndex = index + 1
+				break
+			}
+		}
+
+	case voiceNoteSentMsg:
+		if msg.err != nil {
+			m.errorMsg = msg.err.Error()
+		} else {
+			m.errorMsg = ""
+			m.notice = "Voice note sent."
+		}
+
 	case viewerLoadedMsg:
 		if m.viewer == nil || m.viewer.uri != msg.uri {
 			return m, nil
@@ -425,7 +520,7 @@ func (m Model) notificationCmd(incoming []matrix.Notification) tea.Cmd {
 	}
 	var pending []pendingNotification
 	for _, notification := range incoming {
-		if notification.RoomID == "" || (m.currentRoom != nil && notification.RoomID == m.currentRoom.ID) {
+		if notification.RoomID == "" || notification.Category == matrix.NotificationCategoryGroup || (m.currentRoom != nil && notification.RoomID == m.currentRoom.ID) {
 			continue
 		}
 		roomName := notification.Room
@@ -512,6 +607,9 @@ func (m Model) View() string {
 	if m.viewer != nil {
 		return m.viewerView()
 	}
+	if m.audioDevicePickerOpen {
+		return m.audioDevicePickerView()
+	}
 	if m.showHelp {
 		helpView := m.help.help.View(keys)
 		return helpView
@@ -530,6 +628,58 @@ func (m Model) View() string {
 	composer := panel(composerStyle, g.composer, m.borderFor(FocusComposer), m.composer.View())
 	right := lipgloss.JoinVertical(lipgloss.Left, m.headerBar(g.header), timeline, composer, m.footerBar(g.footer))
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+func (m Model) updateAudioDevicePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	optionCount := len(m.audioInputDevices) + 1
+	switch msg.String() {
+	case "up":
+		if !m.audioDevicePickerLoading {
+			m.audioDevicePickerIndex = (m.audioDevicePickerIndex + optionCount - 1) % optionCount
+		}
+	case "down":
+		if !m.audioDevicePickerLoading {
+			m.audioDevicePickerIndex = (m.audioDevicePickerIndex + 1) % optionCount
+		}
+	case "enter":
+		if m.audioDevicePickerLoading {
+			return m, nil
+		}
+		if m.audioDevicePickerIndex == 0 {
+			m.voiceInputDeviceID = ""
+			m.notice = "Using the system-default microphone."
+		} else {
+			device := m.audioInputDevices[m.audioDevicePickerIndex-1]
+			m.voiceInputDeviceID = device.id
+			m.notice = "Using microphone: " + device.name
+		}
+		m.audioDevicePickerOpen = false
+		m.errorMsg = ""
+	case "esc":
+		m.audioDevicePickerOpen = false
+	}
+	return m, nil
+}
+
+func (m Model) audioDevicePickerView() string {
+	lines := []string{"Select voice-note microphone", "Up/Down to move, Enter to select, Esc to cancel", ""}
+	if m.audioDevicePickerLoading {
+		lines = append(lines, "Loading microphones...")
+	} else {
+		options := append([]audioInputDevice{{name: "System default"}}, m.audioInputDevices...)
+		for index, device := range options {
+			marker := "  "
+			if index == m.audioDevicePickerIndex {
+				marker = "> "
+			}
+			lines = append(lines, marker+device.name)
+		}
+	}
+	content := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(1, 2).Render(strings.Join(lines, "\n"))
+	if m.width > 0 && m.height > 0 {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, content)
+	}
+	return content
 }
 
 func panel(style lipgloss.Style, r rect, borderColor lipgloss.Color, content string) string {
@@ -718,6 +868,22 @@ func (m Model) composerHint() string {
 		return "editing · enter save · esc cancel"
 	}
 	return "enter send · alt+enter newline · esc timeline"
+}
+
+func (m *Model) finishVoiceRecording() tea.Cmd {
+	recorder := m.voiceRecorder
+	roomID := m.voiceRoomID
+	client := m.client
+	m.voiceRecorder = nil
+	m.voiceRoomID = ""
+	data, durationMilliseconds, err := recorder.Stop()
+	if err != nil {
+		m.errorMsg = err.Error()
+		return nil
+	}
+	return func() tea.Msg {
+		return voiceNoteSentMsg{err: client.SendVoiceNote(context.Background(), roomID, "voice-note.wav", data, durationMilliseconds)}
+	}
 }
 
 func replySenderName(msg *matrix.Message) string {

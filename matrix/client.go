@@ -95,6 +95,7 @@ type Room struct {
 	Favorite        bool
 	Muted           bool
 	Unread          int
+	MarkedUnread    bool
 	Mentions        int
 	Unanswered      bool
 	LastEventID     string
@@ -189,12 +190,31 @@ type Update struct {
 	ConnectionState       ConnectionState
 }
 
+// Notification categories used by per-category notification settings.
+const (
+	NotificationCategoryDirect  = "direct"
+	NotificationCategoryMention = "mention"
+	NotificationCategoryGroup   = "group"
+)
+
 type Notification struct {
-	RoomID  string
-	Room    string
-	Sender  string
-	Body    string
-	Mention bool
+	RoomID   string
+	Room     string
+	Sender   string
+	Body     string
+	Mention  bool
+	Category string
+}
+
+func notificationCategory(direct, highlight bool) string {
+	switch {
+	case direct:
+		return NotificationCategoryDirect
+	case highlight:
+		return NotificationCategoryMention
+	default:
+		return NotificationCategoryGroup
+	}
 }
 
 type Client struct {
@@ -1037,6 +1057,17 @@ func (c *Client) EditMessage(ctx context.Context, roomID, text, editID string) e
 }
 
 func (c *Client) SendAttachment(ctx context.Context, roomID, filename string, data []byte) error {
+	return c.sendAttachment(ctx, roomID, filename, data, 0)
+}
+
+func (c *Client) SendVoiceNote(ctx context.Context, roomID, filename string, data []byte, durationMilliseconds int64) error {
+	if durationMilliseconds <= 0 || durationMilliseconds > int64((4*time.Minute)/time.Millisecond) {
+		return errors.New("voice note duration must be between 1 ms and 4 minutes")
+	}
+	return c.sendAttachment(ctx, roomID, filename, data, durationMilliseconds)
+}
+
+func (c *Client) sendAttachment(ctx context.Context, roomID, filename string, data []byte, voiceDurationMilliseconds int64) error {
 	if len(data) == 0 {
 		return errors.New("attachment is empty")
 	}
@@ -1081,6 +1112,15 @@ func (c *Client) SendAttachment(ctx context.Context, roomID, filename string, da
 		Body:     filename,
 		FileName: filename,
 		Info:     info,
+	}
+	if voiceDurationMilliseconds > 0 {
+		if msgType != event.MsgAudio {
+			return errors.New("voice note data must have an audio MIME type")
+		}
+		content.Body = "Voice message"
+		content.Info.Duration = int(voiceDurationMilliseconds)
+		content.MSC1767Audio = &event.MSC1767Audio{Duration: int(voiceDurationMilliseconds), Waveform: []int{}}
+		content.MSC3245Voice = &event.MSC3245Voice{}
 	}
 	uploadData := data
 	var encryptedFile *attachment.EncryptedFile
@@ -1263,14 +1303,45 @@ func (c *Client) MarkRead(ctx context.Context, roomID, eventID string) error {
 		return err
 	}
 	defer finish()
+	c.mu.RLock()
+	markedUnread := c.rooms[roomID].MarkedUnread
+	c.mu.RUnlock()
 	if err = c.engine.MarkRead(ctx, id.RoomID(roomID), id.EventID(eventID), event.ReceiptTypeRead); err != nil {
 		return fmt.Errorf("mark Matrix room as read: %w", err)
+	}
+	if markedUnread {
+		if err = c.engine.Client.SetRoomAccountData(ctx, id.RoomID(roomID), event.AccountDataMarkedUnread.Type, &event.MarkedUnreadEventContent{Unread: false}); err != nil {
+			return fmt.Errorf("clear Matrix room's marked-unread state: %w", err)
+		}
 	}
 	c.mu.Lock()
 	room, ok := c.rooms[roomID]
 	if ok {
 		room.Unread = 0
+		room.MarkedUnread = false
 		room.Mentions = 0
+		c.rooms[roomID] = room
+	}
+	c.mu.Unlock()
+	if ok {
+		c.publish(nil, "")
+	}
+	return nil
+}
+
+func (c *Client) MarkUnread(ctx context.Context, roomID string) error {
+	ctx, finish, err := c.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	if err = c.engine.Client.SetRoomAccountData(ctx, id.RoomID(roomID), event.AccountDataMarkedUnread.Type, &event.MarkedUnreadEventContent{Unread: true}); err != nil {
+		return fmt.Errorf("mark Matrix room as unread: %w", err)
+	}
+	c.mu.Lock()
+	room, ok := c.rooms[roomID]
+	if ok {
+		room.MarkedUnread = true
 		c.rooms[roomID] = room
 	}
 	c.mu.Unlock()
@@ -1747,6 +1818,7 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 			}
 			room.Direct = isDirectRoom(meta)
 			room.Unread = meta.UnreadMessages + meta.UnreadNotifications
+			room.MarkedUnread = meta.MarkedUnread != nil && *meta.MarkedUnread
 			room.Mentions = meta.UnreadHighlights
 			room.Bridge = bridgeLabel(meta)
 			if !meta.SortingTimestamp.Time.IsZero() {
@@ -1761,7 +1833,7 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 		}
 		if notify {
 			for _, notification := range syncRoom.Notifications {
-				if notification.Event == nil || (!notification.Highlight && !room.Direct) {
+				if notification.Event == nil {
 					continue
 				}
 				if c.engine.Account != nil && notification.Event.Sender == c.engine.Account.UserID {
@@ -1781,11 +1853,12 @@ func (c *Client) applySync(syncEvent *jsoncmd.SyncComplete, notify bool) {
 						sender = message.Sender
 					}
 					c.pendingNotifications = append(c.pendingNotifications, Notification{
-						RoomID:  key,
-						Room:    room.Name,
-						Sender:  sender,
-						Body:    message.Body,
-						Mention: notification.Highlight,
+						RoomID:   key,
+						Room:     room.Name,
+						Sender:   sender,
+						Body:     message.Body,
+						Mention:  notification.Highlight,
+						Category: notificationCategory(room.Direct, notification.Highlight),
 					})
 				}
 			}

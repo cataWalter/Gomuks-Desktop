@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"encoding/binary"
 	"errors"
 	"image"
 	"image/color"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -118,5 +120,39 @@ func TestVideoRowShowsDurationAndOpenHint(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "▶ video  1:05  press o to open") {
 		t.Fatalf("video label missing:\n%s", rendered)
+	}
+}
+
+func TestVoiceWAVHasPCMHeadersAndDuration(t *testing.T) {
+	pcm := []byte{0x34, 0x12, 0x78, 0x56}
+	wav, err := encodeVoiceWAV(pcm, 16000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wav[:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
+		t.Fatalf("invalid WAV signature: %q %q", wav[:4], wav[8:12])
+	}
+	if got := binary.LittleEndian.Uint32(wav[24:28]); got != 16000 {
+		t.Fatalf("sample rate = %d, want 16000", got)
+	}
+	if got := binary.LittleEndian.Uint32(wav[40:44]); got != uint32(len(pcm)) {
+		t.Fatalf("PCM data size = %d, want %d", got, len(pcm))
+	}
+}
+
+func TestAudioMessageLabelShowsDurationAndPlayKey(t *testing.T) {
+	label := audioLabel(matrix.Message{MediaType: "m.audio", MediaDurationMs: 6500})
+	if !strings.Contains(label, "0:06") || !strings.Contains(label, "press p to play") {
+		t.Fatalf("audio label = %q, want duration and play hint", label)
+	}
+}
+
+func TestWriteOpenableAudioUsesPlayableExtension(t *testing.T) {
+	path, err := writeOpenableMedia(t.TempDir(), matrix.Message{ID: "$voice", MediaMIME: "audio/wave"}, []byte("audio"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Ext(path); got != ".wav" {
+		t.Fatalf("audio file extension = %q, want .wav", got)
 	}
 }

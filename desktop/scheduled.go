@@ -31,16 +31,17 @@ const (
 )
 
 type ScheduledJob struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"`
-	RoomID    string `json:"roomId"`
-	Text      string `json:"text"`
-	EventID   string `json:"eventId"`
+	ID             string `json:"id"`
+	AccountID      string `json:"accountId"`
+	Kind           string `json:"kind"`
+	RoomID         string `json:"roomId"`
+	Text           string `json:"text"`
+	EventID        string `json:"eventId"`
 	ReplyToEventID string `json:"replyToEventId,omitempty"`
-	DueAt     int64  `json:"dueAt"`
-	CreatedAt int64  `json:"createdAt"`
-	Status    string `json:"status"`
-	Error     string `json:"error"`
+	DueAt          int64  `json:"dueAt"`
+	CreatedAt      int64  `json:"createdAt"`
+	Status         string `json:"status"`
+	Error          string `json:"error"`
 }
 
 type scheduledJobStore struct {
@@ -71,6 +72,9 @@ func newScheduledJobStore(path string) (*scheduledJobStore, error) {
 		return nil, fmt.Errorf("secure scheduled jobs file: %w", err)
 	}
 	for index := range store.jobs {
+		if store.jobs[index].AccountID == "" {
+			store.jobs[index].AccountID = primaryAccountID
+		}
 		if store.jobs[index].Status == scheduledSending {
 			store.jobs[index].Status = scheduledFailed
 			store.jobs[index].Error = "The app closed while sending. Check the room before retrying."
@@ -82,25 +86,28 @@ func newScheduledJobStore(path string) (*scheduledJobStore, error) {
 	return store, nil
 }
 
-func (s *scheduledJobStore) scheduleMessage(roomID, text string, dueAt int64) (ScheduledJob, error) {
-	return s.create(scheduledMessageKind, roomID, strings.TrimSpace(text), "", "", dueAt)
+func (s *scheduledJobStore) scheduleMessage(accountID, roomID, text string, dueAt int64) (ScheduledJob, error) {
+	return s.create(scheduledMessageKind, accountID, roomID, strings.TrimSpace(text), "", "", dueAt)
 }
 
-func (s *scheduledJobStore) scheduleReminder(roomID, eventID, text string, dueAt int64) (ScheduledJob, error) {
-	return s.create(scheduledReminderKind, roomID, strings.TrimSpace(text), eventID, "", dueAt)
+func (s *scheduledJobStore) scheduleReminder(accountID, roomID, eventID, text string, dueAt int64) (ScheduledJob, error) {
+	return s.create(scheduledReminderKind, accountID, roomID, strings.TrimSpace(text), eventID, "", dueAt)
 }
 
-func (s *scheduledJobStore) scheduleReply(roomID, text, replyToEventID string, dueAt int64) (ScheduledJob, error) {
+func (s *scheduledJobStore) scheduleReply(accountID, roomID, text, replyToEventID string, dueAt int64) (ScheduledJob, error) {
 	replyToEventID = strings.TrimSpace(replyToEventID)
 	if replyToEventID == "" {
 		return ScheduledJob{}, errors.New("scheduled reply requires a target event ID")
 	}
-	return s.create(scheduledMessageKind, roomID, strings.TrimSpace(text), "", replyToEventID, dueAt)
+	return s.create(scheduledMessageKind, accountID, roomID, strings.TrimSpace(text), "", replyToEventID, dueAt)
 }
 
-func (s *scheduledJobStore) create(kind, roomID, text, eventID, replyToEventID string, dueAt int64) (ScheduledJob, error) {
+func (s *scheduledJobStore) create(kind, accountID, roomID, text, eventID, replyToEventID string, dueAt int64) (ScheduledJob, error) {
 	if kind != scheduledMessageKind && kind != scheduledReminderKind {
 		return ScheduledJob{}, errors.New("unsupported scheduled job kind")
+	}
+	if strings.TrimSpace(accountID) == "" {
+		return ScheduledJob{}, errors.New("scheduled job requires an account ID")
 	}
 	if strings.TrimSpace(roomID) == "" {
 		return ScheduledJob{}, errors.New("scheduled job requires a room ID")
@@ -116,15 +123,16 @@ func (s *scheduledJobStore) create(kind, roomID, text, eventID, replyToEventID s
 		return ScheduledJob{}, fmt.Errorf("generate scheduled job ID: %w", err)
 	}
 	job := ScheduledJob{
-		ID:        hex.EncodeToString(randomID[:]),
-		Kind:      kind,
-		RoomID:    roomID,
-		Text:      text,
-		EventID:   eventID,
+		ID:             hex.EncodeToString(randomID[:]),
+		AccountID:      accountID,
+		Kind:           kind,
+		RoomID:         roomID,
+		Text:           text,
+		EventID:        eventID,
 		ReplyToEventID: replyToEventID,
-		DueAt:     dueAt,
-		CreatedAt: time.Now().UnixMilli(),
-		Status:    scheduledPending,
+		DueAt:          dueAt,
+		CreatedAt:      time.Now().UnixMilli(),
+		Status:         scheduledPending,
 	}
 
 	s.mu.Lock()
@@ -138,10 +146,17 @@ func (s *scheduledJobStore) create(kind, roomID, text, eventID, replyToEventID s
 }
 
 func (s *scheduledJobStore) list() []ScheduledJob {
+	return s.listForAccount("")
+}
+
+func (s *scheduledJobStore) listForAccount(accountID string) []ScheduledJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	jobs := make([]ScheduledJob, 0, len(s.jobs))
 	for _, job := range s.jobs {
+		if accountID != "" && job.AccountID != accountID {
+			continue
+		}
 		if job.Status == scheduledSent || job.Status == scheduledCancelled || job.Status == scheduledDismissed {
 			continue
 		}
@@ -154,13 +169,17 @@ func (s *scheduledJobStore) list() []ScheduledJob {
 }
 
 func (s *scheduledJobStore) claimDue(kind string, now int64) ([]ScheduledJob, error) {
+	return s.claimDueForAccount(kind, now, "")
+}
+
+func (s *scheduledJobStore) claimDueForAccount(kind string, now int64, accountID string) ([]ScheduledJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previous := append([]ScheduledJob(nil), s.jobs...)
 	claimed := make([]ScheduledJob, 0)
 	for index := range s.jobs {
 		job := &s.jobs[index]
-		if job.Kind != kind || job.Status != scheduledPending || job.DueAt > now {
+		if job.Kind != kind || job.Status != scheduledPending || job.DueAt > now || accountID != "" && job.AccountID != accountID {
 			continue
 		}
 		if kind == scheduledMessageKind {

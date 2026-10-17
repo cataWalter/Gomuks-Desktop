@@ -39,6 +39,16 @@ var mediaExtensions = map[string]string{
 	"image/png":       ".png",
 	"image/gif":       ".gif",
 	"image/webp":      ".webp",
+	"audio/aac":       ".aac",
+	"audio/flac":      ".flac",
+	"audio/mpeg":      ".mp3",
+	"audio/mp4":       ".m4a",
+	"audio/ogg":       ".ogg",
+	"audio/opus":      ".opus",
+	"audio/wav":       ".wav",
+	"audio/wave":      ".wav",
+	"audio/x-wav":     ".wav",
+	"audio/webm":      ".webm",
 	"video/mp4":       ".mp4",
 	"video/quicktime": ".mov",
 	"video/webm":      ".webm",
@@ -69,6 +79,19 @@ func posterURI(msg matrix.Message) string {
 	return ""
 }
 
+func isAudioMessage(msg matrix.Message) bool {
+	return msg.MediaType == "m.audio" || strings.HasPrefix(msg.MediaMIME, "audio/")
+}
+
+func audioLabel(msg matrix.Message) string {
+	label := "audio message"
+	if msg.MediaDurationMs > 0 {
+		seconds := msg.MediaDurationMs / 1000
+		label += fmt.Sprintf("  %d:%02d", seconds/60, seconds%60)
+	}
+	return label + "  press p to play"
+}
+
 // mediaLines returns the poster and label rows drawn below a message, cols wide.
 func (m *timelineModel) mediaLines(msg matrix.Message, cols int) []string {
 	var lines []string
@@ -87,6 +110,9 @@ func (m *timelineModel) mediaLines(msg matrix.Message, cols int) []string {
 	}
 	if msg.MediaType == "m.video" {
 		lines = append(lines, mediaIndent+videoLabel(msg))
+	}
+	if isAudioMessage(msg) && msg.MediaURI != "" {
+		lines = append(lines, mediaIndent+audioLabel(msg))
 	}
 	return lines
 }

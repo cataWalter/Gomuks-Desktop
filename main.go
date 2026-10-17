@@ -23,6 +23,8 @@ var (
 var frontendAssets embed.FS
 
 func main() {
+	desktop.AppVersion = Version
+
 	// Check for TUI subcommand
 	if len(os.Args) > 1 && os.Args[1] == "tui" {
 		if err := tui.Main(); err != nil {
@@ -51,11 +53,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	mediaCacheDir := ""
 	if cacheDir, cacheErr := os.UserCacheDir(); cacheErr == nil && cacheDir != "" {
-		client.SetMediaCacheDir(filepath.Join(cacheDir, "gomuks-desktop", "media"))
+		mediaCacheDir = filepath.Join(cacheDir, "gomuks-desktop", "media")
+		client.SetMediaCacheDir(mediaCacheDir)
 	}
 
-	if err = desktop.Run(client, frontendAssets, paths.PreferencesFile); err != nil {
+	if err = desktop.Run(client, frontendAssets, paths.DataDir, paths.PreferencesFile, mediaCacheDir); err != nil {
 		log.Fatal(err)
 	}
 }
