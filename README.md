@@ -1,94 +1,155 @@
 # Pinger
 
-This desktop client embeds gomuks' `pkg/hicli` engine in a Wails v3 host with a
-React and TypeScript interface. It stores the gomuks SQLite database and a
-private Olm pickle key under the current user's configuration directory. On
-first launch, existing Fyne data, preferences, and encryption keys are migrated
-to the current app data directory; the legacy database is copied with SQLite's
-online backup API.
+[![CI](https://github.com/cataWalter/pinger/actions/workflows/ci.yml/badge.svg)](https://github.com/cataWalter/pinger/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/cataWalter/pinger)](https://github.com/cataWalter/pinger/releases)
+[![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Wails v3](https://img.shields.io/badge/Wails-v3.0.0_beta.30-ff5e14)](https://wails.io)
+[![License: AGPL-3.0+](https://img.shields.io/badge/license-AGPL--3.0%2B-blue.svg)](#license)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](#run-locally)
 
-The local SQLite cache contains message data, including decrypted event
-contents. The application restricts its data directory to the current user;
-use operating-system disk encryption for protection at rest. gomuks is
-AGPL-3.0-or-later, so review its license obligations before distributing an
-application that embeds it.
+Desktop client for [gomuks](https://github.com/gomuks) — a Matrix client with SQLite caching, media storage, and a terminal interface. Pinger embeds gomuks' `pkg/hicli` engine in a [Wails v3](https://wails.io) (Go) host with a React + TypeScript interface, and also ships the gomuks terminal client.
+
+> **License note:** This application embeds `gomuks`' `pkg/hicli` engine. Review the AGPL-3.0-or-later license obligations before distributing.
+
+## Contents
+
+- [Features](#features)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [Data storage & privacy](#data-storage--privacy)
+- [Run locally](#run-locally)
+- [Project structure](#project-structure)
+- [Development & checks](#development--checks)
+- [Releases](#releases)
+- [License](#license)
+
+## Features
+
+**Triage & workflow**
+
+- **Needs reply** sidebar view, persisted in SQLite. Mark a room answered with `E` (configurable in Settings → Keyboard); `Ctrl+Z` / `⌘Z` restores the most recently dismissed room. Triage shortcuts are ignored while the composer is focused.
+- **Quick switcher** (`Ctrl+K` / `⌘K`) jumps to any room by name; **message search** (`Ctrl+F` / `⌘F`) searches local history across rooms; `/` focuses room search.
+- **Room filters & navigation**: `Ctrl+Shift+U` shows only unanswered rooms, `Ctrl+Shift+A` shows all; `Ctrl+1`–`Ctrl+9` jump to a room by list position; `Alt+↑`/`Alt+↓` cycle rooms; `Ctrl+Shift+L` jumps to the latest message.
+
+**Messaging**
+
+- Reply and quick-reaction controls stay visible; replying opens a threaded quote composer; reactions show as chips. The **More** menu offers Set reminder, edit, delete, retry, preview, and copy.
+- The composer accepts pasted images and files dropped onto the window.
+
+**Room details & media**
+
+- The header toggles the sidebar; **Details** opens a panel with the room topic and members.
+- Room/member avatars and attachments are downloaded from Matrix content URIs and stored in the on-disk media cache; avatars are also cached in memory for the session and resized for display. Missing images use a generated initials icon.
+
+**System tray & notifications**
+
+- Reopen the window, mark rooms read, or quit; the tray icon reflects unread activity. Closing the window can minimize to tray; the startup preference registers the app with the OS. Clicking a notification focuses the app and opens the relevant room.
+
+**Settings** (`Ctrl+,` / `⌘,`)
+
+- **Account** (profile, logout) · **Appearance** (theme, outgoing message color, font size, avatars, compact layout, clock format) · **Notifications** (permission, alerts only when unfocused, sound/volume, privacy) · **Keyboard** (Ctrl+Enter to send, mark-answered shortcut, full shortcut list) · **History** (messages loaded when a room opens) · **Devices** (list/revoke) · **Storage** (DB/WAL/media sizes, clear media cache, VACUUM) · **Security** (verification status, room-key export/import with passphrase) · **About** (version, build date).
+
+## Keyboard shortcuts
+
+Press `?` in the app (or open Settings → Keyboard) for the authoritative list.
+
+| Shortcut | Action |
+| --- | --- |
+| `E` *(configurable)* | Mark the selected room answered |
+| `Ctrl+Z` / `⌘Z` | Undo — restore the last answered room |
+| `?` | Open Settings → Keyboard (full shortcut list) |
+| `/` or `Ctrl+Shift+S` / `⌘⇧S` | Focus room search |
+| `Ctrl+K` / `⌘K` | Open the quick switcher |
+| `Ctrl+F` / `⌘F` | Search local message history across rooms |
+| `Ctrl+,` / `⌘,` | Open Settings |
+| `Alt+↑` / `Alt+↓` | Previous / next room |
+| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Previous / next unanswered room |
+| `Ctrl+Shift+U` | Filter to unanswered rooms only |
+| `Ctrl+Shift+A` | Show all rooms (clear filters) |
+| `Ctrl+Shift+L` | Jump to the latest message |
+| `Ctrl+1` … `Ctrl+9` | Jump to room by list position |
+| `Ctrl+Enter` / `⌘↩` | Send message *(toggleable in Settings → Keyboard)* |
+
+## Data storage & privacy
+
+| | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| **Data directory** | `~/Library/Application Support/gomuks-desktop` | `%AppData%\gomuks-desktop` | `~/.config/gomuks-desktop` |
+| **Media cache** | `~/Library/Caches/gomuks-desktop/media` | `%LocalAppData%\gomuks-desktop\media` | `~/.cache/gomuks-desktop/media` |
+
+- The data directory holds the SQLite database (`matrix.db`), app preferences (`preferences.json`), and the Olm pickle key (`crypto.key`).
+- The local SQLite cache stores message data, including decrypted event contents. Downloaded media is cached under the user's cache directory; encrypted payloads are decrypted before caching, and cache files are owner-only. Clearing the media cache (Settings → Storage) removes only downloaded media — use OS disk encryption for protection at rest.
+- On first launch, data from the legacy Fyne build (`fyne-matrix` data directory and `fi.mau.fyne-matrix` preferences) is migrated into the current data directory; the legacy database is copied with SQLite's online backup API.
 
 ## Run locally
 
-The desktop app targets macOS 12 or newer and Windows x64 with the WebView2
-Runtime. Building requires Go 1.26 or newer, Node.js 22 or newer with npm, and
-the Xcode Command Line Tools for macOS builds. The `sqlite_fts5` build tag is
-required. The `goolm` tag selects mautrix-go's pure-Go Olm implementation, so
-libolm does not need to be installed.
+Targets macOS 12+ and Windows x64 with the WebView2 Runtime.
 
-From the repository root, install the frontend dependencies, build the frontend,
-and launch the desktop app:
+### Prerequisites
+
+- [Go 1.26+](https://go.dev/dl/)
+- [Node.js 22+](https://nodejs.org/) with npm
+- Wails CLI **v3.0.0-beta.30** (must match `go.mod`):
+  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30`
+- macOS: Xcode Command Line Tools (`xcode-select --install`)
+- Windows: [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+
+Two Go build tags are used throughout: `sqlite_fts5` is required (SQLite full-text search), and `goolm` selects mautrix-go's pure-Go Olm implementation (no libolm needed).
+
+### Build and run
+
+From the repository root:
 
 ```sh
+wails3 generate bindings -f '-tags sqlite_fts5,goolm' -clean=true -ts -i
 npm --prefix frontend ci
 npm --prefix frontend run build
 go run -tags "sqlite_fts5 goolm" .
 ```
 
-The Go command stays attached to the terminal while the app is running. Quit
-with `Cmd+Q` or stop it with `Ctrl+C`. On later launches, run only the Go
-command; rebuild the frontend first whenever its source or dependencies change.
+- The Go command stays attached to the terminal — quit with `Cmd+Q` or `Ctrl+C`. On later launches, run only the Go command (rebuild the frontend first if it changed).
+- Rebuild the frontend when its source or dependencies change — assets stay embedded in the binary. Regenerate bindings after Go service method changes; `wails3 task dev` does both.
+- Matrix sync events are handled off the UI thread and delivered to the React interface through Wails runtime events.
 
-The terminal interface can be started without building the frontend:
+### Terminal interface
+
+Without the desktop frontend:
 
 ```sh
 go run -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 ```
 
-For live development with the Wails frontend and Go hot-reload workflow, install
-the Wails CLI version matching `go.mod` if needed, then run:
+The desktop binary also embeds the terminal client behind a `tui` subcommand:
 
 ```sh
-go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30
+go run -tags "sqlite_fts5 goolm" . tui
+```
+
+### Live development
+
+```sh
 wails3 task dev
 ```
 
-This development command starts the Vite server and desktop app together; use
-it instead of the direct `go run` command while developing.
+Hot-reloads the frontend via Vite and rebuilds the Go app on change.
 
-Matrix sync events are handled off the UI thread and sent to the React interface
-through Wails runtime events.
+## Project structure
 
-Room and member profile images are downloaded from their Matrix content URIs,
-cached in memory for the current app session, and resized for display. Missing
-or unavailable images use a generated initials icon instead.
+| Path | Purpose |
+| --- | --- |
+| `main.go` | Entry point — embeds the frontend, migrates legacy data, starts the desktop app or TUI |
+| `desktop/` | Wails application: services, preferences, system tray, scheduled reminders, attachments |
+| `frontend/` | React + TypeScript UI (Vite build, vitest tests) |
+| `matrix/` | Matrix client wrapper around gomuks' `hicli` engine |
+| `migration/` | First-run migration from the legacy Fyne app |
+| `tui/` | Terminal interface (bubbletea) |
+| `cmd/gomuks-tui/` | Standalone TUI binary |
+| `build/` | Wails build configuration and platform assets |
+| `assets/` | Application icons |
+| `.github/workflows/` | CI and release pipelines |
 
-The sidebar includes a persisted **Needs reply** view. Marking a room answered
-stores the latest event ID in the local SQLite database; a later incoming event
-can put the room back in that view. `E` marks the selected room answered, and
-`Ctrl+Z` / `⌘Z` restores the most recently dismissed room. Triage shortcuts are
-ignored while the message composer is focused. The chat header can hide or
-restore the room sidebar, and its **Details** control opens an optional panel
-with the selected room's topic and members.
+## Development & checks
 
-Messages keep **Reply** and quick reaction controls visible; the **More** menu
-contains context-specific actions such as edit, delete, retry, preview, and
-copy.
-
-Open **Settings** from the sidebar or with `Ctrl+,` / `⌘,` to configure theme,
-timeline avatars and clock format, notification privacy, and the Enter-to-send
-behavior. The Storage tab reports the SQLite database/WAL size, can clear the
-in-memory avatar cache, and can run SQLite `VACUUM`. This client currently does
-not keep a disk media cache.
-
-The composer also has an emoji picker and accepts pasted images and files
-dropped onto the window. The system tray can reopen the window, mark rooms read,
-or quit; its icon reflects unread activity. Closing the window can minimize the
-app to the tray, and the startup preference registers the app with the host OS.
-Clicking a notification focuses the app and opens the relevant room.
-
-Pushing a `v*` tag runs the standalone release workflow. It builds universal
-macOS binaries for the desktop app and terminal interface, plus Windows x64
-binaries for both, and attaches the packages and SHA-256 checksums to the
-GitHub Release.
-
-Build the frontend before compiling the Go app. The focused backend checks do not
-launch a desktop window:
+Build the frontend before compiling Go. The same checks run in CI on every push to `main` and pull request; backend checks don't launch a desktop window:
 
 ```sh
 npm --prefix frontend ci
@@ -100,20 +161,8 @@ go build -tags "sqlite_fts5 goolm" .
 go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 ```
 
-Tagged versions (`v*`) trigger the GitHub Actions release workflow. It builds
-universal (arm64 + amd64) macOS binaries on `macos-latest` and x64 Windows
-binaries on `windows-latest` for both the desktop app and standalone TUI. The
-macOS binaries are packaged as
-`Pinger-<version>-macos-universal.dmg` and
-`Pinger-TUI-<version>-macos-universal.dmg`; Windows packages are
-`Pinger-<version>-windows-amd64.zip` and
-`Pinger-TUI-<version>-windows-amd64.zip`. Releases include a `checksums.txt`
-SHA-256 manifest. The desktop disk image contains the signed app plus an
-`/Applications` symlink; the TUI disk image contains the `gomuks-tui` binary
-plus a `bin` symlink to `/usr/local/bin`. Windows ZIPs contain `pinger.exe` or
-`gomuks-tui.exe`; the desktop executable embeds its icon and manifest. Pinger
-desktop release builds embed the version, commit, and build timestamp; builds
-outside the release workflow report `dev` as their version.
+Press `?` in the app for the full keyboard shortcuts list.
 
-Manually dispatching the workflow builds and uploads the DMGs and ZIPs as
-workflow artifacts. Only a version-tag run publishes a GitHub Release.
+## Releases
+
+Pushing a `v*` tag runs the standalone release workflow. Tagged versions (`v*`) trigger GitHub Actions, which builds universal (arm64 + amd64) macOS binaries on `macos-latest` for the desktop app and standalone TUI, and x64 Windows binaries on `windows-latest`, and x64 Linux binaries on `ubuntu-latest`; the desktop executable embeds its icon and manifest. Artifacts: `Pinger-<version>-macos-universal.dmg`, `Pinger-TUI-<version>-macos-universal.dmg`, `Pinger-<version>-windows-amd64.zip`, `Pinger-TUI-<version>-windows-amd64.zip`, `Pinger-<version>-linux-amd64.deb`, `Pinger-<version>-linux-amd64.AppImage`. The macOS DMG contains the signed app plus an `/Applications` symlink; the TUI DMG contains the `gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Releases include a `checksums.txt` SHA-256 manifest. Desktop release builds embed version, commit, and build timestamp; other builds report `dev`. Manually dispatching the workflow uploads DMGs/ZIPs as artifacts; only a version-tag run publishes a GitHub Release.

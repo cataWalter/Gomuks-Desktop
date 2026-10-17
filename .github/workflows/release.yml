@@ -270,10 +270,190 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-linux:
+    name: Build Linux x64 deb and AppImage
+    runs-on: ubuntu-latest
+    needs: [test]
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.0-dev libsqlite3-dev librsvg2-bin
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate Wails bindings
+        shell: bash
+        run: |
+          GOBIN="${RUNNER_TEMP}/wails-bin" go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30
+          "${RUNNER_TEMP}/wails-bin/wails3" generate bindings -f '-tags sqlite_fts5,goolm' -clean=true -ts -i
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Prepare build metadata
+        shell: bash
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          echo "DEB_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          mkdir -p dist
+
+      - name: Render application icons
+        shell: bash
+        run: |
+          mkdir -p dist/icons
+          for size in 16 32 48 64 128 256 512 1024; do
+            rsvg-convert --width "$size" --height "$size" \
+              --output "dist/icons/${size}.png" assets/icon1.svg
+          done
+
+      - name: Build Linux x64 binaries
+        shell: bash
+        env:
+          CGO_ENABLED: 1
+          GOARCH: amd64
+          GOOS: linux
+          CC: gcc
+        run: |
+          go build -tags "sqlite_fts5 goolm" -trimpath -buildvcs=false \
+            -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=${BUILD_DATE}" \
+            -o dist/pinger .
+          go build -tags "sqlite_fts5 goolm" -trimpath -buildvcs=false -ldflags="-s -w" \
+            -o dist/gomuks-tui ./cmd/gomuks-tui
+          chmod 755 dist/pinger dist/gomuks-tui
+
+      - name: Build DEB package
+        shell: bash
+        run: |
+          stage="$(mktemp -d)/pinger"
+          mkdir -p "$stage/DEBIAN" \
+            "$stage/usr/bin" \
+            "$stage/usr/share/applications" \
+            "$stage/usr/share/icons/hicolor" \
+            "$stage/usr/share/pixmaps" \
+            "$stage/usr/share/doc/pinger"
+
+          cat > "$stage/DEBIAN/control" <<EOF
+          Package: pinger
+          Version: ${DEB_VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Pinger <pinger@localhost>
+          Depends: libwebkit2gtk-4.0-0
+          Description: Desktop client for gomuks -- a Matrix client
+           Pinger is a desktop client for gomuks, a Matrix client with
+           SQLite caching, media storage, and a terminal interface.
+          EOF
+
+          cp dist/pinger "$stage/usr/bin/pinger"
+          cp dist/gomuks-tui "$stage/usr/bin/gomuks-tui"
+          chmod 755 "$stage/usr/bin/pinger" "$stage/usr/bin/gomuks-tui"
+
+          cat > "$stage/usr/share/applications/pinger.desktop" <<EOF
+          [Desktop Entry]
+          Name=Pinger
+          Comment=Desktop client for gomuks -- a Matrix client
+          Exec=pinger
+          Icon=pinger
+          Type=Application
+          Categories=Network;InstantMessaging;
+          Terminal=false
+          EOF
+
+          for size in 16 32 48 64 128 256 512 1024; do
+            dir="$stage/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dir"
+            cp "dist/icons/${size}.png" "$dir/pinger.png"
+          done
+          cp dist/icons/1024.png "$stage/usr/share/pixmaps/pinger.png"
+
+          cp README.md "$stage/usr/share/doc/pinger/"
+
+          dpkg-deb --root-owner-group --build "$stage" \
+            "dist/Pinger-${VERSION}-linux-amd64.deb"
+          ls -lh dist/*.deb
+
+      - name: Build AppImage
+        shell: bash
+        run: |
+          appdir="$(mktemp -d)/pinger.AppDir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" \
+            "$appdir/usr/share/icons/hicolor" "$appdir/usr/share/pixmaps"
+
+          cat > "$appdir/AppRun" <<'EOF'
+          #!/bin/sh
+          SELF="$(readlink -f "$0")"
+          DIR="$(dirname "$SELF")"
+          exec "$DIR/usr/bin/pinger" "$@"
+          EOF
+          chmod 755 "$appdir/AppRun"
+
+          cp dist/pinger "$appdir/usr/bin/pinger"
+          cp dist/gomuks-tui "$appdir/usr/bin/gomuks-tui"
+          chmod 755 "$appdir/usr/bin/pinger" "$appdir/usr/bin/gomuks-tui"
+
+          cat > "$appdir/pinger.desktop" <<EOF
+          [Desktop Entry]
+          Name=Pinger
+          Comment=Desktop client for gomuks -- a Matrix client
+          Exec=pinger
+          Icon=pinger
+          Type=Application
+          Categories=Network;InstantMessaging;
+          Terminal=false
+          EOF
+          cp "$appdir/pinger.desktop" "$appdir/usr/share/applications/pinger.desktop"
+
+          for size in 16 32 48 64 128 256 512 1024; do
+            dir="$appdir/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dir"
+            cp "dist/icons/${size}.png" "$dir/pinger.png"
+          done
+          cp dist/icons/1024.png "$appdir/usr/share/pixmaps/pinger.png"
+
+          wget -c "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" \
+            -O dist/appimagetool
+          chmod +x dist/appimagetool
+          ARCH=x86_64 dist/appimagetool "$appdir" \
+            "dist/Pinger-${VERSION}-linux-amd64.AppImage"
+          ls -lh dist/*.AppImage
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, build-windows]
+    needs: [build, build-windows, build-linux]
     runs-on: macos-latest
     steps:
       - name: Download platform artifacts
@@ -284,7 +464,7 @@ jobs:
 
       - name: Generate SHA-256 checksums
         working-directory: dist
-        run: shasum -a 256 ./*.dmg ./*.zip > checksums.txt
+        run: shasum -a 256 ./*.dmg ./*.zip ./*.deb ./*.AppImage > checksums.txt
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
@@ -293,4 +473,6 @@ jobs:
           files: |
             dist/*.dmg
             dist/*.zip
+            dist/*.deb
+            dist/*.AppImage
             dist/checksums.txt
