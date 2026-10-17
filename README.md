@@ -5,7 +5,7 @@
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Wails v3](https://img.shields.io/badge/Wails-v3.0.0_beta.30-ff5e14)](https://wails.io)
 [![License: AGPL-3.0+](https://img.shields.io/badge/license-AGPL--3.0%2B-blue.svg)](#license)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](#run-locally)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#run-locally)
 
 Desktop client for [gomuks](https://github.com/gomuks) — a Matrix client with SQLite caching, media storage, and a terminal interface. Pinger embeds gomuks' `pkg/hicli` engine in a [Wails v3](https://wails.io) (Go) host with a React + TypeScript interface, and also ships the gomuks terminal client.
 
@@ -42,6 +42,7 @@ Desktop client for [gomuks](https://github.com/gomuks) — a Matrix client with 
 
 **System tray & notifications**
 
+- On macOS, desktop and TUI alerts use native Notification Center under the Pinger app identity and icon when launched from the bundled app. The TUI requests notification permission when its first eligible message arrives; desktop settings control permission, focus, muted rooms, sound, and privacy.
 - Reopen the window, mark rooms read, or quit; the tray icon reflects unread activity. Closing the window can minimize to tray; the startup preference registers the app with the OS. Clicking a notification focuses the app and opens the relevant room.
 
 **Settings** (`Ctrl+,` / `⌘,`)
@@ -82,7 +83,7 @@ Press `?` in the app (or open Settings → Keyboard) for the authoritative list.
 
 ## Run locally
 
-Targets macOS 12+ and Windows x64 with the WebView2 Runtime.
+Targets macOS 12+, Windows x64 (WebView2 Runtime), and Linux x64.
 
 ### Prerequisites
 
@@ -92,6 +93,7 @@ Targets macOS 12+ and Windows x64 with the WebView2 Runtime.
   `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30`
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
 - Windows: [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+- Linux: GTK3 and WebKit2GTK development libraries (required by Wails on Linux)
 
 Two Go build tags are used throughout: `sqlite_fts5` is required (SQLite full-text search), and `goolm` selects mautrix-go's pure-Go Olm implementation (no libolm needed).
 
@@ -161,8 +163,22 @@ go build -tags "sqlite_fts5 goolm" .
 go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 ```
 
-Press `?` in the app for the full keyboard shortcuts list.
-
 ## Releases
 
-Pushing a `v*` tag runs the standalone release workflow. Tagged versions (`v*`) trigger GitHub Actions, which builds universal (arm64 + amd64) macOS binaries on `macos-latest` for the desktop app and standalone TUI, and x64 Windows binaries on `windows-latest`, and x64 Linux binaries on `ubuntu-latest`; the desktop executable embeds its icon and manifest. Artifacts: `Pinger-<version>-macos-universal.dmg`, `Pinger-TUI-<version>-macos-universal.dmg`, `Pinger-<version>-windows-amd64.zip`, `Pinger-TUI-<version>-windows-amd64.zip`, `Pinger-<version>-linux-amd64.deb`, `Pinger-<version>-linux-amd64.AppImage`. The macOS DMG contains the signed app plus an `/Applications` symlink; the TUI DMG contains the `gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Releases include a `checksums.txt` SHA-256 manifest. Desktop release builds embed version, commit, and build timestamp; other builds report `dev`. Manually dispatching the workflow uploads DMGs/ZIPs as artifacts; only a version-tag run publishes a GitHub Release.
+Pushing a `v*` tag runs the release workflow, which builds universal (arm64 + amd64) macOS binaries on `macos-latest`, x64 Windows binaries on `windows-latest`, and x64 Linux binaries on `ubuntu-latest`, then publishes a GitHub Release. Manually dispatching the workflow uploads the same packages as workflow artifacts without publishing a release.
+
+| Artifact | Contents |
+| --- | --- |
+| `Pinger-<version>-macos-universal.dmg` | Signed app + `/Applications` symlink |
+| `Pinger-TUI-<version>-macos-universal.dmg` | `gomuks-tui` binary + `bin` symlink to `/usr/local/bin` |
+| `Pinger-<version>-windows-amd64.zip` | `pinger.exe` with embedded icon and manifest |
+| `Pinger-TUI-<version>-windows-amd64.zip` | `gomuks-tui.exe` |
+| `Pinger-<version>-linux-amd64.deb` | Debian package for Linux x64 |
+| `Pinger-<version>-linux-amd64.AppImage` | Portable AppImage for Linux x64 |
+| `checksums.txt` | SHA-256 manifest for all packages |
+
+Desktop release builds embed version, commit, and build timestamp via ldflags; other builds report `dev`.
+
+## License
+
+AGPL-3.0-or-later, matching the embedded gomuks `hicli` engine. See [gnu.org/licenses](https://www.gnu.org/licenses/agpl-3.0.html) for the license text.

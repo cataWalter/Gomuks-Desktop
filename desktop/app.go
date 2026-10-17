@@ -11,6 +11,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 	"mychat/matrix"
+	"mychat/notifications"
 )
 
 const (
@@ -18,6 +19,7 @@ const (
 	hostErrorEventName         = "matrix:host-error"
 	attachmentSentEventName    = "matrix:attachment-sent"
 	scheduledReminderEventName = "scheduler:reminder"
+	notificationOpenRoomName   = "notification:open-room"
 )
 
 func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
@@ -35,12 +37,18 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	service := &AppService{client: client, preferences: preferences, ctx: ctx, cancel: cancel, scheduled: scheduledJobs}
+	notifier := notifications.New()
+	service := &AppService{client: client, preferences: preferences, notifier: notifier, ctx: ctx, cancel: cancel, scheduled: scheduledJobs}
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
 			service.close()
 			client.Close()
+			if lifecycle, ok := notifier.(notifications.Lifecycle); ok {
+				if closeErr := lifecycle.Close(); closeErr != nil {
+					log.Printf("stop native notifications: %v", closeErr)
+				}
+			}
 		})
 	}
 
@@ -58,6 +66,11 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		},
 		OnShutdown: shutdown,
 	})
+	if lifecycle, ok := notifier.(notifications.Lifecycle); ok {
+		if startErr := lifecycle.Start(ctx); startErr != nil {
+			log.Printf("native notifications unavailable: %v", startErr)
+		}
+	}
 	service.quit = app.Quit
 	service.emitReminder = func(reminder ScheduledJob) {
 		app.Event.Emit(scheduledReminderEventName, reminder)
@@ -91,6 +104,12 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	tray.SetIcon(normalIcon)
 	tray.SetTooltip("Pinger")
 	tray.AttachWindow(window)
+	if handler, ok := notifier.(notifications.ClickHandler); ok {
+		handler.SetClickHandler(func(roomID string) {
+			tray.ShowWindow()
+			app.Event.Emit(notificationOpenRoomName, roomID)
+		})
+	}
 	menu := application.NewMenu()
 	menu.Add("Open").OnClick(func(_ *application.Context) {
 		tray.ShowWindow()

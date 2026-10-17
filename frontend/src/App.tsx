@@ -513,6 +513,7 @@ function App() {
   const preferencesRef = useRef<PreferenceValues>({})
   const roomsRef = useRef<Room[]>([])
   const messagesRef = useRef<Message[]>([])
+  const nativeNotificationsRef = useRef(false)
   const lastReadEventByRoom = useRef(new Map<string, string>())
   const draftsRef = useRef(new Map<string, string>())
   const triageBusyRef = useRef(false)
@@ -526,6 +527,16 @@ function App() {
   const composerInputRef = useRef<HTMLTextAreaElement>(null)
   const quickSwitcherInputRef = useRef<HTMLInputElement>(null)
   const pendingSearchJumpRef = useRef<{ roomID: string; eventID: string; timelineCursor: number } | null>(null)
+
+  useEffect(() => {
+    let active = true
+    void AppService.NativeNotificationsSupported()
+      .then((supported) => {
+        if (active) nativeNotificationsRef.current = supported
+      })
+      .catch(() => {})
+    return () => { active = false }
+  }, [])
 
   const selectedRoom = (snapshot?.rooms ?? []).find((room) => room.id === selectedRoomID)
   const selectedRoomAvatar = selectedRoom?.avatar || (
@@ -857,7 +868,6 @@ function App() {
         if (preferenceBoolean(currentPreferences, `room.muted.${notification.roomId}`)) continue
         if (notification.roomId === selectedRoomRef.current) continue
         if (preferenceBoolean(currentPreferences, 'notifications.only_when_unfocused', true) && document.hasFocus()) continue
-        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') continue
         const roomName = notification.room || roomsRef.current.find((room) => room.id === notification.roomId)?.name || notification.roomId
         let title = notification.sender ? `${notification.sender} · ${roomName}` : roomName
         let body = notification.body
@@ -870,15 +880,25 @@ function App() {
             body = 'New activity'
             break
         }
-        try {
-          const systemNotification = new Notification(title, { body })
-          systemNotification.onclick = () => {
-            window.focus()
-            showRoom(notification.roomId)
+        if (nativeNotificationsRef.current) {
+          void AppService.SendNotification(title, body, notification.roomId)
+            .then((delivered) => {
+              if (delivered && preferenceBoolean(currentPreferences, 'notifications.sound')) {
+                playNotificationSound(preferenceNumber(currentPreferences, 'notifications.volume', 50))
+              }
+            })
+            .catch((notificationError: unknown) => setError(describeError(notificationError)))
+        } else if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try {
+            const systemNotification = new Notification(title, { body })
+            systemNotification.onclick = () => {
+              window.focus()
+              showRoom(notification.roomId)
+            }
+            if (preferenceBoolean(currentPreferences, 'notifications.sound')) playNotificationSound(preferenceNumber(currentPreferences, 'notifications.volume', 50))
+          } catch (notificationError) {
+            setError(describeError(notificationError))
           }
-          if (preferenceBoolean(currentPreferences, 'notifications.sound')) playNotificationSound(preferenceNumber(currentPreferences, 'notifications.volume', 50))
-        } catch (notificationError) {
-          setError(describeError(notificationError))
         }
       }
       if (update.error) setError(update.error)
@@ -904,6 +924,13 @@ function App() {
       const message = (event.data as { error?: string } | undefined)?.error
       if (active && message) setError(message)
     })
+    const unsubscribeNotificationOpenRoom = Events.On('notification:open-room', (event: any) => {
+      const roomID = event.data as string | undefined
+      if (active && roomID) {
+        window.focus()
+        showRoom(roomID)
+      }
+    })
     const unsubscribeAttachmentSent = Events.On('matrix:attachment-sent', (event: any) => {
       if (active && event.data === selectedRoomRef.current) {
         setHistoryRevision((revision) => revision + 1)
@@ -916,7 +943,9 @@ function App() {
       const body = reminder.text.trim() || `You set a reminder for ${roomName}.`
       setScheduledNotice(`${roomName}: ${body}`)
       void refreshScheduledJobs()
-      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      if (nativeNotificationsRef.current) {
+        void AppService.SendNotification(`Reminder · ${roomName}`, body, reminder.roomId).catch((notificationError: unknown) => setScheduledJobsError(describeError(notificationError)))
+      } else if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
         try {
           const notification = new Notification(`Reminder · ${roomName}`, { body })
           notification.onclick = () => {
@@ -945,6 +974,7 @@ function App() {
       active = false
       unsubscribe()
       unsubscribeHostError()
+      unsubscribeNotificationOpenRoom()
       unsubscribeAttachmentSent()
       unsubscribeScheduledReminder()
     }
@@ -2587,7 +2617,24 @@ function SettingsDialog({
   const [logoutBusy, setLogoutBusy] = useState(false)
   const [notificationPermission, setNotificationPermission] = useState(() => typeof Notification === 'undefined' ? 'unsupported' : Notification.permission)
 
+  useEffect(() => {
+    let active = true
+    void AppService.NativeNotificationsSupported()
+      .then((supported) => supported ? AppService.NotificationPermission() : typeof Notification === 'undefined' ? 'unsupported' : Notification.permission)
+      .then((permission) => { if (active) setNotificationPermission(permission) })
+      .catch(() => { if (active) setNotificationPermission('unsupported') })
+    return () => { active = false }
+  }, [])
+
   async function enableSystemNotifications() {
+    if (await AppService.NativeNotificationsSupported()) {
+      try {
+        setNotificationPermission(await AppService.RequestNotificationPermission())
+      } catch {
+        setNotificationPermission('unsupported')
+      }
+      return
+    }
     if (typeof Notification === 'undefined') {
       setNotificationPermission('unsupported')
       return
@@ -2784,7 +2831,7 @@ function SettingsDialog({
           {tab === 'Notifications' && (
             <div className="settings-section">
               <h3>Notifications</h3>
-              <div className="setting-row notification-permission"><span><strong>System permission</strong><small>{notificationPermission === 'granted' ? 'Allowed' : notificationPermission === 'denied' ? 'Blocked by the system' : notificationPermission === 'unsupported' ? 'Unavailable in this WebView' : 'Permission needed for desktop alerts.'}</small></span>
+              <div className="setting-row notification-permission"><span><strong>System permission</strong><small>{notificationPermission === 'granted' ? 'Allowed' : notificationPermission === 'denied' ? 'Blocked by the system' : notificationPermission === 'unsupported' ? 'Unavailable for this launch' : 'Permission needed for desktop alerts.'}</small></span>
                 <button className="settings-command" type="button" disabled={notificationPermission === 'granted' || notificationPermission === 'unsupported'} onClick={() => void enableSystemNotifications()}><Bell size={14} />{notificationPermission === 'granted' ? 'Allowed' : 'Enable'}</button>
               </div>
               <PreferenceToggle label="Enable notifications" checked={preferenceBoolean(preferences, 'notifications.enabled', true)} onChange={(value) => onPreferenceChange('notifications.enabled', value)} />

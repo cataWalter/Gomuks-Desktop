@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"mychat/matrix"
+	"mychat/notifications"
 )
 
 type AppService struct {
 	client       *matrix.Client
 	preferences  *PreferenceStore
+	notifier     notifications.Notifier
 	ctx          context.Context
 	cancel       context.CancelFunc
 	quit         func()
@@ -540,6 +542,34 @@ func (s *AppService) markAllRead() error {
 
 func (s *AppService) SetStringPreference(key, value string) error {
 	return s.preferences.Set(key, value)
+}
+
+func (s *AppService) NativeNotificationsSupported() bool {
+	return s.notifier != nil && s.notifier.Supported()
+}
+
+func (s *AppService) NotificationPermission() string {
+	if s.notifier == nil {
+		return "unsupported"
+	}
+	return s.notifier.Permission()
+}
+
+func (s *AppService) RequestNotificationPermission() (string, error) {
+	if s.notifier == nil {
+		return "unsupported", nil
+	}
+	return s.notifier.RequestPermission()
+}
+
+func (s *AppService) SendNotification(title, body, roomID string) (bool, error) {
+	if s.notifier == nil || !s.notifier.Supported() || s.notifier.Permission() != "granted" {
+		return false, nil
+	}
+	if err := s.notifier.Send(title, body, roomID, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *AppService) Logout() error {

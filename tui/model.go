@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"mychat/matrix"
+	"mychat/notifications"
 )
 
 type Focus int
@@ -42,6 +43,7 @@ type Model struct {
 	nativeImages  bool
 	notice        string
 	confirmDelete string
+	notifier      notifications.Notifier
 }
 
 func NewModel(client *matrix.Client) *Model {
@@ -58,6 +60,7 @@ func NewModel(client *matrix.Client) *Model {
 		connection:  matrix.StateOffline,
 		typing:      make(map[string][]string),
 		needsVerif:  false,
+		notifier:    notifications.New(),
 	}
 }
 
@@ -81,6 +84,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var notificationCmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -396,6 +400,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		notificationCmd = m.notificationCmd(update.Notifications)
 	}
 
 	var cmd tea.Cmd
@@ -406,7 +411,66 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.timeline, cmd = m.timeline.Update(msg)
 		}
 	}
-	return m, cmd
+	return m, tea.Batch(cmd, notificationCmd)
+}
+
+func (m Model) notificationCmd(incoming []matrix.Notification) tea.Cmd {
+	if m.notifier == nil || len(incoming) == 0 {
+		return nil
+	}
+	type pendingNotification struct {
+		title  string
+		body   string
+		roomID string
+	}
+	var pending []pendingNotification
+	for _, notification := range incoming {
+		if notification.RoomID == "" || (m.currentRoom != nil && notification.RoomID == m.currentRoom.ID) {
+			continue
+		}
+		roomName := notification.Room
+		muted := false
+		for _, room := range m.roomsList {
+			if room.ID == notification.RoomID {
+				if roomName == "" {
+					roomName = room.Name
+				}
+				muted = room.Muted
+				break
+			}
+		}
+		if muted {
+			continue
+		}
+		if roomName == "" {
+			roomName = notification.RoomID
+		}
+		title := roomName
+		if notification.Sender != "" {
+			title = notification.Sender + " - " + roomName
+		}
+		body := notification.Body
+		if body == "" {
+			body = "New message"
+		}
+		pending = append(pending, pendingNotification{title: title, body: body, roomID: notification.RoomID})
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	notifier := m.notifier
+	return func() tea.Msg {
+		if notifier.Permission() == "default" {
+			permission, err := notifier.RequestPermission()
+			if err != nil || permission != "granted" {
+				return nil
+			}
+		}
+		for _, notification := range pending {
+			_ = notifier.Send(notification.title, notification.body, notification.roomID, false)
+		}
+		return nil
+	}
 }
 
 func timeRef(t int64) time.Time {

@@ -7,7 +7,41 @@ import (
 	"testing"
 
 	"mychat/matrix"
+	"mychat/notifications"
 )
+
+type recordedNotification struct {
+	title  string
+	body   string
+	roomID string
+	sound  bool
+}
+
+type recordingNotifier struct {
+	sent       []recordedNotification
+	permission string
+}
+
+func (n *recordingNotifier) Supported() bool { return true }
+
+func (n *recordingNotifier) Permission() string {
+	if n.permission == "" {
+		return "default"
+	}
+	return n.permission
+}
+
+func (n *recordingNotifier) RequestPermission() (string, error) {
+	n.permission = "granted"
+	return "granted", nil
+}
+
+func (n *recordingNotifier) Send(title, body, roomID string, sound bool) error {
+	n.sent = append(n.sent, recordedNotification{title: title, body: body, roomID: roomID, sound: sound})
+	return nil
+}
+
+var _ notifications.Notifier = (*recordingNotifier)(nil)
 
 func TestMapRoomsWithPreferences(t *testing.T) {
 	rooms := []matrix.Room{{ID: "!room:example.org", Name: "General"}}
@@ -79,5 +113,40 @@ func TestSendAttachmentRejectsOversizedData(t *testing.T) {
 	err := service.SendAttachment("!room:example.org", "large.bin", make([]byte, maxAttachmentSize+1))
 	if err == nil || !strings.Contains(err.Error(), "50 MiB") {
 		t.Fatalf("error = %v, want 50 MiB limit error", err)
+	}
+}
+
+func TestAppServiceNotificationMethodsUseInjectedNotifier(t *testing.T) {
+	notifier := &recordingNotifier{}
+	service := &AppService{notifier: notifier}
+
+	if !service.NativeNotificationsSupported() {
+		t.Fatal("native notifications should be supported")
+	}
+	if got := service.NotificationPermission(); got != "default" {
+		t.Fatalf("permission = %q, want default", got)
+	}
+	delivered, err := service.SendNotification("Pinger", "New message", "!room:example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivered {
+		t.Fatal("notification was reported delivered before permission was granted")
+	}
+	if len(notifier.sent) != 0 {
+		t.Fatal("notification was sent before permission was granted")
+	}
+	if got, err := service.RequestNotificationPermission(); err != nil || got != "granted" {
+		t.Fatalf("requested permission = %q, %v; want granted", got, err)
+	}
+	delivered, err = service.SendNotification("Pinger", "New message", "!room:example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !delivered {
+		t.Fatal("notification was not reported delivered after permission was granted")
+	}
+	if len(notifier.sent) != 1 || notifier.sent[0] != (recordedNotification{title: "Pinger", body: "New message", roomID: "!room:example.org"}) {
+		t.Fatalf("sent notifications = %+v", notifier.sent)
 	}
 }

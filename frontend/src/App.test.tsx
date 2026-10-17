@@ -23,6 +23,10 @@ const harness = vi.hoisted(() => ({
     SetTyping: vi.fn(),
     MarkRead: vi.fn(),
     SetStringPreference: vi.fn(),
+    NativeNotificationsSupported: vi.fn(),
+    NotificationPermission: vi.fn(),
+    RequestNotificationPermission: vi.fn(),
+    SendNotification: vi.fn(),
   },
 }))
 
@@ -143,6 +147,10 @@ describe('room history updates', () => {
     harness.service.SetTyping.mockResolvedValue(undefined)
     harness.service.MarkRead.mockResolvedValue(undefined)
     harness.service.SetStringPreference.mockResolvedValue(undefined)
+    harness.service.NativeNotificationsSupported.mockResolvedValue(false)
+    harness.service.NotificationPermission.mockResolvedValue('default')
+    harness.service.RequestNotificationPermission.mockResolvedValue('granted')
+    harness.service.SendNotification.mockResolvedValue(false)
 
     let firstPageRequest = true
     harness.service.History.mockImplementation(async (_roomID: string, before: number) => {
@@ -192,6 +200,32 @@ describe('room history updates', () => {
     expect(await screen.findByText('oldest history')).toBeTruthy()
     expect(screen.getByText('older history')).toBeTruthy()
     expect(harness.service.History).toHaveBeenLastCalledWith(room.id, 20)
+  })
+
+  it('sends incoming alerts through the native notification service when available', async () => {
+    harness.service.NativeNotificationsSupported.mockResolvedValue(true)
+    harness.service.SendNotification.mockResolvedValue(true)
+    harness.service.Snapshot.mockResolvedValue({
+      ...snapshot,
+      rooms: [room, secondRoom],
+      preferences: { 'notifications.only_when_unfocused': false },
+    })
+    render(<App />)
+
+    expect(await screen.findByText('latest message')).toBeTruthy()
+    act(() => {
+      harness.eventHandlers.get('matrix:update')?.({
+        data: {
+          notifications: [{ roomId: secondRoom.id, room: secondRoom.name, sender: 'Alice', body: 'A native alert' }],
+        },
+      })
+    })
+
+    await waitFor(() => expect(harness.service.SendNotification).toHaveBeenCalledWith('Alice · Second room', 'A native alert', secondRoom.id))
+    act(() => {
+      harness.eventHandlers.get('notification:open-room')?.({ data: secondRoom.id })
+    })
+    await waitFor(() => expect(harness.service.History).toHaveBeenCalledWith(secondRoom.id, 0))
   })
 
   it('loads older messages automatically when the timeline is scrolled to the top', async () => {

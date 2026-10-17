@@ -10,7 +10,42 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"mychat/matrix"
+	"mychat/notifications"
 )
+
+type tuiNotification struct {
+	title  string
+	body   string
+	roomID string
+}
+
+type tuiNotifier struct {
+	sent       []tuiNotification
+	permission string
+	requests   int
+}
+
+func (*tuiNotifier) Supported() bool { return true }
+
+func (n *tuiNotifier) Permission() string {
+	if n.permission == "" {
+		return "granted"
+	}
+	return n.permission
+}
+
+func (n *tuiNotifier) RequestPermission() (string, error) {
+	n.requests++
+	n.permission = "granted"
+	return "granted", nil
+}
+
+func (n *tuiNotifier) Send(title, body, roomID string, _ bool) error {
+	n.sent = append(n.sent, tuiNotification{title: title, body: body, roomID: roomID})
+	return nil
+}
+
+var _ notifications.Notifier = (*tuiNotifier)(nil)
 
 func TestRoomsFiltered(t *testing.T) {
 	rm := newRoomsModel()
@@ -33,6 +68,33 @@ func TestRoomsFiltered(t *testing.T) {
 	fr = rm.filteredRooms()
 	if len(fr) != 3 {
 		t.Fatalf("expected 3, got %d", len(fr))
+	}
+}
+
+func TestMatrixUpdateSendsNativeNotificationsOutsideMutedAndCurrentRooms(t *testing.T) {
+	model := NewModel(nil)
+	notifier := &tuiNotifier{permission: "default"}
+	model.notifier = notifier
+	model.currentRoom = &matrix.Room{ID: "!current:example.org"}
+	model.roomsList = []matrix.Room{{ID: "!muted:example.org", Name: "Muted", Muted: true}}
+
+	_, cmd := model.update(MatrixUpdateMsg{Update: matrix.Update{Notifications: []matrix.Notification{
+		{RoomID: "!other:example.org", Room: "Other", Sender: "Alice", Body: "Hello"},
+		{RoomID: "!current:example.org", Room: "Current", Sender: "Bob", Body: "Here"},
+		{RoomID: "!muted:example.org", Room: "Muted", Sender: "Carol", Body: "Quiet"},
+	}}})
+	if cmd == nil {
+		t.Fatal("expected an asynchronous notification command")
+	}
+	cmd()
+	if len(notifier.sent) != 1 {
+		t.Fatalf("sent notifications = %+v, want only the other room", notifier.sent)
+	}
+	if got := notifier.sent[0]; got.title != "Alice - Other" || got.body != "Hello" || got.roomID != "!other:example.org" {
+		t.Fatalf("notification = %+v", got)
+	}
+	if notifier.requests != 1 {
+		t.Fatalf("permission requests = %d, want 1", notifier.requests)
 	}
 }
 

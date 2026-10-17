@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"mychat/matrix"
+	"mychat/notifications"
 )
 
 func Run(client *matrix.Client) error {
@@ -21,8 +22,18 @@ func Run(client *matrix.Client) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
+		if lifecycle, ok := model.notifier.(notifications.Lifecycle); ok {
+			if closeErr := lifecycle.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "stop native notifications: %v\n", closeErr)
+			}
+		}
 		client.Close()
 	}()
+	if lifecycle, ok := model.notifier.(notifications.Lifecycle); ok {
+		if startErr := lifecycle.Start(ctx); startErr != nil {
+			fmt.Fprintf(os.Stderr, "native notifications unavailable: %v\n", startErr)
+		}
+	}
 
 	go func() {
 		for {
