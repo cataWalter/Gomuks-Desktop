@@ -91,7 +91,7 @@ func (m loginModel) View() string {
 		status = lipgloss.NewStyle().Foreground(mention).Render(m.err)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Foreground(accent).Bold(true).Render("GOMUKS / MATRIX"),
+		lipgloss.NewStyle().Foreground(accent).Bold(true).Render("PINGER / MATRIX"),
 		status,
 		"",
 		m.homeserver.View(),

@@ -1765,7 +1765,7 @@ function App() {
     return (
       <main className="boot-screen">
         <div className="boot-mark"><MessageCircleMore size={20} /></div>
-        <span>Gomuks Desktop</span>
+        <span>Pinger</span>
         {error && <p role="alert">{error}</p>}
       </main>
     )
@@ -1777,7 +1777,7 @@ function App() {
         <section className="auth-panel" aria-labelledby="auth-title">
           <div className="auth-brand">
             <span className="brand-glyph"><MessageCircleMore size={22} strokeWidth={2.1} /></span>
-            <span>gomuks</span>
+            <span>Pinger</span>
           </div>
           <div className="auth-heading">
             <span className="eyebrow">MATRIX ACCOUNT</span>
@@ -1806,9 +1806,9 @@ function App() {
           <div className="auth-footnote"><LockKeyhole size={14} /><span>Session and encryption keys stay on this device.</span></div>
         </section>
         <div className="auth-side" aria-hidden="true">
-          <div className="auth-side-mark">G.</div>
+          <div className="auth-side-mark">P.</div>
           <div className="auth-side-grid" />
-          <div className="auth-side-bottom"><span>GOMUKS DESKTOP</span><span>01 / 01</span></div>
+          <div className="auth-side-bottom"><span>PINGER</span><span>01 / 01</span></div>
         </div>
       </main>
     )
@@ -1829,7 +1829,7 @@ function App() {
         <section className="auth-panel" aria-labelledby="verify-title">
           <div className="auth-brand">
             <span className="brand-glyph"><ShieldCheck size={21} /></span>
-            <span>gomuks</span>
+            <span>Pinger</span>
           </div>
           <div className="auth-heading">
             <span className="eyebrow">ENCRYPTION SETUP</span>
@@ -1850,9 +1850,9 @@ function App() {
           <div className="auth-footnote"><LockKeyhole size={14} /><span>Your key is used locally to verify encryption.</span></div>
         </section>
         <div className="auth-side" aria-hidden="true">
-          <div className="auth-side-mark">G.</div>
+          <div className="auth-side-mark">P.</div>
           <div className="auth-side-grid" />
-          <div className="auth-side-bottom"><span>GOMUKS DESKTOP</span><span>01 / 01</span></div>
+          <div className="auth-side-bottom"><span>PINGER</span><span>01 / 01</span></div>
         </div>
       </main>
     )
@@ -1876,7 +1876,7 @@ function App() {
       <aside className="sidebar">
         <div className="sidebar-brand">
           <span className="brand-glyph"><MessageCircleMore size={19} strokeWidth={2.1} /></span>
-          <span>gomuks</span>
+          <span>Pinger</span>
           <span className="brand-edition">DESKTOP</span>
         </div>
         <div className="room-list-heading">
@@ -2728,7 +2728,7 @@ function SettingsDialog({
     <div className="settings-scrim" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
       <DialogSurface className="settings-dialog" labelledBy="settings-title" onClose={onClose}>
         <header className="settings-header">
-          <div><span className="eyebrow">GOMUKS DESKTOP</span><h2 id="settings-title">Settings</h2></div>
+          <div><span className="eyebrow">PINGER</span><h2 id="settings-title">Settings</h2></div>
           <button className="icon-button" type="button" aria-label="Close settings" title="Close settings" onClick={onClose}><X size={17} /></button>
         </header>
         <nav className="settings-tabs" role="tablist" aria-label="Settings sections">
@@ -2910,10 +2910,10 @@ function SettingsDialog({
           )}
           {tab === 'About' && (
             <div className="settings-section">
-              <h3>Gomuks Desktop</h3>
-              <div className="account-details"><span>Application</span><strong>Gomuks Desktop</strong><span>Matrix engine</span><strong>gomuks</strong><span>License</span><strong>AGPL-3.0-or-later</strong></div>
-              <a className="settings-link" href="https://github.com/cataWalter/Gomuks-Desktop" target="_blank" rel="noreferrer">Project repository</a>
-              <a className="settings-link" href="https://github.com/cataWalter/Gomuks-Desktop/issues" target="_blank" rel="noreferrer">Report an issue</a>
+              <h3>Pinger</h3>
+              <div className="account-details"><span>Application</span><strong>Pinger</strong><span>Matrix engine</span><strong>gomuks</strong><span>License</span><strong>AGPL-3.0-or-later</strong></div>
+              <a className="settings-link" href="https://github.com/cataWalter/pinger" target="_blank" rel="noreferrer">Project repository</a>
+              <a className="settings-link" href="https://github.com/cataWalter/pinger/issues" target="_blank" rel="noreferrer">Report an issue</a>
             </div>
           )}
         </div>

@@ -5,9 +5,9 @@ version: '3'
 
 # This information is used to generate the build assets.
 info:
-  companyName: "Gomuks"
-  productName: "Gomuks Desktop"
-  productIdentifier: "fi.mau.gomuks-desktop"
+  companyName: "Pinger"
+  productName: "Pinger"
+  productIdentifier: "fi.mau.pinger"
   description: "A Matrix desktop client"
   version: "0.1.0"
   # cfBundleIconName: "appicon" # The macOS icon name in Assets.car icon bundles (optional)

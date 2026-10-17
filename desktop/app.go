@@ -45,7 +45,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	}
 
 	app := application.New(application.Options{
-		Name:        "Gomuks Desktop",
+		Name:        "Pinger",
 		Description: "A Matrix desktop client",
 		Services: []application.Service{
 			application.NewService(service),
@@ -75,7 +75,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 
 	window := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:               "main",
-		Title:              "Gomuks Desktop",
+		Title:              "Pinger",
 		Width:              1100,
 		Height:             720,
 		MinWidth:           760,
@@ -89,7 +89,7 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 	normalIcon, unreadIcon := trayIcons()
 	tray := app.SystemTray.New()
 	tray.SetIcon(normalIcon)
-	tray.SetTooltip("Gomuks Desktop")
+	tray.SetTooltip("Pinger")
 	tray.AttachWindow(window)
 	menu := application.NewMenu()
 	menu.Add("Open").OnClick(func(_ *application.Context) {
@@ -146,10 +146,10 @@ func Run(client *matrix.Client, assets fs.FS, preferencesPath string) error {
 		if unread != lastUnread {
 			if unread > 0 {
 				tray.SetIcon(unreadIcon)
-				tray.SetTooltip(fmt.Sprintf("Gomuks Desktop (%d unread)", unread))
+				tray.SetTooltip(fmt.Sprintf("Pinger (%d unread)", unread))
 			} else {
 				tray.SetIcon(normalIcon)
-				tray.SetTooltip("Gomuks Desktop")
+				tray.SetTooltip("Pinger")
 			}
 			lastUnread = unread
 		}

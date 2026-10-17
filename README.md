@@ -1,4 +1,4 @@
-# Gomuks Desktop
+# Pinger
 
 This desktop client embeds gomuks' `pkg/hicli` engine in a Wails v3 host with a
 React and TypeScript interface. It stores the gomuks SQLite database and a
@@ -102,11 +102,11 @@ go build -tags "sqlite_fts5 goolm" ./cmd/gomuks-tui
 Tagged versions (`v*`) trigger the GitHub Actions release workflow. It builds
 universal (arm64 + amd64) macOS binaries on `macos-latest` for both the desktop
 app and the standalone TUI, packages them as
-`Gomuks-Desktop-<version>-macos-universal.dmg` and
-`Gomuks-TUI-<version>-macos-universal.dmg`, and publishes them with a
+`Pinger-<version>-macos-universal.dmg` and
+`Pinger-TUI-<version>-macos-universal.dmg`, and publishes them with a
 `checksums.txt` SHA-256 manifest. The desktop disk image contains the signed
 app plus an `/Applications` symlink; the TUI disk image contains the
-`gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Desktop release
+`gomuks-tui` binary plus a `bin` symlink to `/usr/local/bin`. Pinger release
 builds embed the version, commit, and build timestamp; builds outside the
 release workflow report `dev` as their version.
 
