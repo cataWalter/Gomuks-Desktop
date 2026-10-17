@@ -52,6 +52,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Generate Wails bindings
+        shell: bash
+        run: |
+          GOBIN="${RUNNER_TEMP}/wails-bin" go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.30
+          "${RUNNER_TEMP}/wails-bin/wails3" generate bindings -f '-tags sqlite_fts5,goolm' -clean=true -ts -i
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
